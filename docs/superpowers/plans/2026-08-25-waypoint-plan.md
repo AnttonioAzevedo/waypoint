@@ -4,7 +4,7 @@
 
 **Goal:** Rebuild Clicky's push-to-talk → screenshot → Claude → speak → point interaction loop as a Linux-native Python app, fully local/free (Claude Code CLI subscription auth, `faster-whisper` STT, `piper-tts` TTS, Ollama fallback), targeting Pop!_OS 24.04 X11/GNOME.
 
-**Architecture:** Single Python process. GTK4 + libadwaita UI (tray, panel, overlay). Pure-logic modules (state machine, tag parsing, context compaction, model routing, memory index, vision-family matching) are dependency-injected and unit tested; hardware/subprocess-facing modules (audio, screen, STT, TTS, the `claude` CLI itself, GTK windows) are integration/manual tested per the spec's own Testing section.
+**Architecture:** Single main Python process (GTK4 + libadwaita UI: panel, overlay) plus one small GTK3 subprocess for the tray icon (AppIndicator3 forces GTK3, incompatible in-process with GTK4 - see Task 17), talking over a local Unix socket. Pure-logic modules (state machine, tag parsing, context compaction, model routing, memory index, vision-family matching) are dependency-injected and unit tested; hardware/subprocess-facing modules (audio, screen, STT, TTS, the `claude` CLI itself, GTK windows) are integration/manual tested per the spec's own Testing section.
 
 **Tech Stack:** Python 3.12, PyGObject (GTK4 + libadwaita + AppIndicator3), `python-xlib`, `mss`, `sounddevice`, `faster-whisper`, `piper-tts`, `pytest`.
 
@@ -42,7 +42,8 @@ waypoint/
     stt.py                  # Component 6 (Task 13)
     tts.py                  # Component 8 (Task 14)
     hotkey.py               # Component 3 (Task 15)
-    tray.py                 # Component 1 (Task 17)
+    tray.py                 # Component 1 (Task 17) - main-process side, Unix socket server
+    tray_process.py         # Component 1 (Task 17) - separate GTK3 subprocess, socket client
     panel.py                # Component 2 (Task 18)
     overlay.py              # Component 9 rendering (Task 19)
     app.py                   # wiring (Task 20)
@@ -1882,68 +1883,154 @@ cd /home/tony/projects/clicky-cc && git add waypoint/.claude/skills/teaching-mod
 
 **Files:**
 - Create: `waypoint/waypoint/tray.py`
+- Create: `waypoint/waypoint/tray_process.py`
 
 **Interfaces:**
-- Produces: `TrayIcon` with `__init__(on_click: Callable[[], None])`, `run() -> None`. Used by Task 20 (app wiring).
+- Produces: `TrayIcon` with `__init__(on_click: Callable[[], None])`, `run() -> None` (non-blocking - spawns the subprocess and a listener thread, then returns), `stop() -> None`. Used by Task 20 (app wiring).
 
-No unit test — `AppIndicator3` requires a live GNOME session. Manual verification only.
+No unit test for the GTK3/AppIndicator3 parts — requires a live GNOME session, manual verification only. The socket IPC path itself was verified with an automated end-to-end check (send a raw `b"click"` message and confirm `on_click` fires), not a real mouse click.
 
-- [ ] **Step 1: Write the implementation**
+**Revised during implementation**: the original plan assumed `AyatanaAppIndicator3` loaded alongside `Gtk 4.0` in one process. Verified live that both assumptions are wrong on this system: (1) the installed typelib namespace is `AppIndicator3`, not `AyatanaAppIndicator3` — Ubuntu's `gir1.2-appindicator3-0.1` package keeps the legacy GI namespace name even though the runtime library is `libayatana-appindicator3`; (2) more importantly, `AppIndicator3`'s typelib unconditionally pulls in **GTK 3**, which cannot coexist with GTK 4 in the same process (`gi.RepositoryError: Requiring namespace 'Gtk' version '4.0', but '3.0' is already loaded`) — confirmed no GTK4-native alternative exists on this system, including the Ayatana fork (`gir1.2-ayatanaappindicator3-0.1` is packaged "GTK-3+ version" too). Fix: the tray icon runs in its own subprocess (`tray_process.py`, GTK3 + AppIndicator3 exclusively), talking to the main GTK4 process over a local Unix domain socket at `WAYPOINT_HOME / "tray.sock"`. Also found: the pip-installed `PyGObject` wheel doesn't search `/usr/lib/girepository-1.0` by default (only the multiarch path) — Ubuntu's typelib installs there specifically, so both files set `GI_TYPELIB_PATH` before any `gi.require_version()` call.
+
+- [ ] **Step 1: Write the main-process side**
 
 ```python
 # waypoint/waypoint/tray.py
-import gi
+"""Component 1: tray icon, running in a separate GTK3 process (see
+module docstring rationale above)."""
+import socket
+import subprocess
+import sys
+import threading
+from typing import Callable, Optional
 
-gi.require_version("Gtk", "4.0")
-gi.require_version("AyatanaAppIndicator3", "0.1")
-from gi.repository import AyatanaAppIndicator3 as AppIndicator3, Gtk  # noqa: E402
+from waypoint.config import WAYPOINT_HOME
 
-from typing import Callable
+TRAY_SOCKET_PATH = WAYPOINT_HOME / "tray.sock"
 
 
 class TrayIcon:
-    """Component 1: AppIndicator3 tray icon. Requires the GNOME
-    AppIndicator/KStatusNotifierItem extension to be active - detect
-    and prompt at startup (see Task 20) rather than fail silently."""
+    """Spawns the GTK3/AppIndicator3 tray subprocess and invokes
+    on_click() in THIS process whenever it's clicked, via a local Unix
+    socket. run() is non-blocking - it starts the subprocess and a
+    background listener thread, then returns, so the caller's own GTK4
+    main loop (panel/overlay) can run in this process afterward."""
 
     def __init__(self, on_click: Callable[[], None]):
         self._on_click = on_click
-        self._indicator = AppIndicator3.Indicator.new(
-            "waypoint",
-            "utilities-terminal",  # placeholder icon name; swap for a real asset
-            AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
-        )
-        self._indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
-
-        menu = Gtk.Menu() if hasattr(Gtk, "Menu") else None
-        # AppIndicator3 predates GTK4's menu model; a minimal GTK3-style
-        # menu is still required here for the click target. Wire
-        # on_click through a single "Open Companion" menu item.
-        self._indicator.set_menu(menu)
+        self._process: Optional[subprocess.Popen] = None
+        self._server: Optional[socket.socket] = None
 
     def run(self) -> None:
-        Gtk.main()
+        TRAY_SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if TRAY_SOCKET_PATH.exists():
+            TRAY_SOCKET_PATH.unlink()
+
+        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server.bind(str(TRAY_SOCKET_PATH))
+        self._server.listen(1)
+
+        threading.Thread(target=self._listen, daemon=True).start()
+
+        self._process = subprocess.Popen(
+            [sys.executable, "-m", "waypoint.tray_process", str(TRAY_SOCKET_PATH)]
+        )
+
+    def _listen(self) -> None:
+        while True:
+            conn, _ = self._server.accept()
+            with conn:
+                data = conn.recv(1024)
+                if data == b"click":
+                    self._on_click()
+
+    def stop(self) -> None:
+        if self._process:
+            self._process.terminate()
+        if self._server:
+            self._server.close()
 ```
 
-**Note for the implementer**: `AppIndicator3` is a GTK3-era API without a clean GTK4 menu equivalent; the exact menu wiring above is a starting point, not gospel — confirm against whatever `AyatanaAppIndicator3` typelib version is actually installed on Pop!_OS 24.04 before trusting the menu construction line, and adjust if the API differs.
+- [ ] **Step 2: Write the GTK3 subprocess**
 
-- [ ] **Step 2: Manual verification**
+```python
+# waypoint/waypoint/tray_process.py
+import os
+import socket
+import sys
+
+os.environ.setdefault("GI_TYPELIB_PATH", "/usr/lib/girepository-1.0")
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AppIndicator3", "0.1")
+from gi.repository import AppIndicator3, Gtk  # noqa: E402
+
+
+def _send_click(socket_path: str) -> None:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(socket_path)
+            sock.sendall(b"click")
+    except OSError:
+        pass  # main process isn't listening (yet) - drop the click rather than crash the tray
+
+
+def main() -> None:
+    socket_path = sys.argv[1]
+
+    indicator = AppIndicator3.Indicator.new(
+        "waypoint",
+        "utilities-terminal",  # placeholder icon name; swap for a real asset
+        AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+    )
+    indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+
+    menu = Gtk.Menu()
+    open_item = Gtk.MenuItem(label="Open Companion")
+    open_item.connect("activate", lambda _widget: _send_click(socket_path))
+    menu.append(open_item)
+    menu.show_all()
+    indicator.set_menu(menu)
+
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 3: Automated IPC verification**
 
 ```bash
 cd /home/tony/projects/clicky-cc/waypoint
 python3 -c "
-from waypoint.tray import TrayIcon
-icon = TrayIcon(on_click=lambda: print('clicked'))
+import socket, time
+from waypoint.tray import TrayIcon, TRAY_SOCKET_PATH
+
+clicked = []
+icon = TrayIcon(on_click=lambda: clicked.append(True))
 icon.run()
+time.sleep(2)
+assert icon._process.poll() is None, 'subprocess died'
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+    sock.connect(str(TRAY_SOCKET_PATH))
+    sock.sendall(b'click')
+time.sleep(0.5)
+assert len(clicked) == 1, 'on_click did not fire'
+icon.stop()
+print('IPC path verified')
 "
 ```
 
-Expected: an icon appears in the GNOME top bar (requires `gnome-shell-extension-appindicator` active — this is spec Component 1's documented fallback prompt if it isn't).
+Expected: `IPC path verified`, no assertion errors. This confirms the subprocess starts without crashing and the socket delivers clicks — it does **not** confirm the icon is visually correct on the real desktop; do that separately by watching the GNOME top bar while running the same snippet without the synthetic socket send (requires `gnome-shell-extension-appindicator` active — spec Component 1's documented fallback prompt if it isn't).
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/tray.py && git commit -m "feat: add AppIndicator3 tray icon"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/tray.py waypoint/waypoint/tray_process.py && git commit -m "feat: add tray icon as a separate GTK3 subprocess (Component 1)"
 ```
 
 ---

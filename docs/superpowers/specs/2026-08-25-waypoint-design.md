@@ -41,7 +41,9 @@ reusing (see Components 10 and 11), not as a dependency or fork target.
 
 ## Architecture
 
-Single Python process, GTK4 + libadwaita for UI. No client-server split, no Cloudflare Worker,
+Single main Python process (GTK4 + libadwaita for UI) plus one small dedicated subprocess for the
+tray icon (GTK3 + AppIndicator3 — see Component 1 for why they can't share a process), talking
+over a local Unix socket. No client-server split, no Cloudflare Worker,
 no API keys — every external call in the current app is replaced by either a local model or a
 local CLI subprocess.
 
@@ -86,11 +88,20 @@ CLI spawn always uses --resume <pinned session_id> (Component 7), never --contin
 
 ## Components
 
-### 1. Tray icon — `AppIndicator3` (via `PyGObject`)
+### 1. Tray icon — `AppIndicator3` (via `PyGObject`), separate GTK3 subprocess
 Standard libappindicator, GNOME on Pop!_OS 24.04 ships the AppIndicator/KStatusNotifierItem
 extension by default. Click opens the companion panel positioned near the tray. Fallback: if
 the extension isn't active, detect at startup and prompt the user to enable
 `gnome-shell-extension-appindicator` (one-time setup note, not code we ship).
+
+**Runs in its own subprocess, not the main process**: verified live that `AppIndicator3`'s
+typelib forces GTK3 to load, which fatally conflicts with the main process's GTK4 requirement
+(`gi.RepositoryError: Requiring namespace 'Gtk' version '4.0', but '3.0' is already loaded`) — no
+GTK4-native tray library is available on this system, including the Ayatana fork (its typelib is
+packaged GTK-3-only). The tray icon and its menu run in a small dedicated subprocess
+(`tray_process.py`, GTK3 + AppIndicator3 only); a click sends a one-word message to the main
+process over a local Unix domain socket. Invisible to the user — same click-to-open behavior —
+but the main (GTK4) and tray (GTK3) processes are architecturally separate.
 
 ### 2. Companion panel — `Gtk.Window` + libadwaita
 Borderless, `set_decorated(False)`, `set_keep_above(True)`. Styled with a custom
