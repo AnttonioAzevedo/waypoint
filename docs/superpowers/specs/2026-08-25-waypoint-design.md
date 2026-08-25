@@ -124,11 +124,26 @@ functional contract (`OpenAIAudioTranscriptionProvider.swift` is the closest exi
 precedent: buffer-then-upload, except now buffer-then-local-transcribe).
 
 ### 7. Chat — `claude` CLI subprocess (Claude Code, user's Pro/Max subscription)
-Spawned via `subprocess.Popen` with `--input-format stream-json --output-format stream-json`.
+Spawned via `subprocess.Popen` with `--input-format stream-json --output-format stream-json
+--strict-mcp-config` (no `--mcp-config` passed, so zero MCP servers load — Waypoint never uses
+the user's Jira/Gmail/Grafana/etc. tool set, and dropping it costs nothing).
 Content blocks (image + text) built in the same shape the original `ClaudeAPI.swift` already
 constructs (`{"type": "image", "source": {"type": "base64", "media_type": ..., "data": ...}}` +
 text block), fed over stdin as NDJSON. Output NDJSON parsed for token deltas, re-emitted as
 progressive text chunks to the UI — replicating the `onTextChunk` streaming callback contract.
+
+**Accepted trade-off — full user environment inherited on purpose**: a `claude` subprocess in
+this `cwd` inherits the user's global hooks, installed plugins (including whatever skills those
+plugins expose), and `CLAUDE.md` persona — confirmed via a live validation call (spike, see
+`waypoint/docs/stream-json-findings.md`). This is deliberate, not an oversight: the user wants
+Waypoint to be "smart" via the same skills he already has installed, not run in an isolated
+bubble. The one real cost is a one-time tax at session bootstrap (~$0.15 on the first turn of a
+pinned session, from hook/skill content entering the prompt cache for the first time) —
+**not a per-turn cost**: every subsequent turn in that same `--resume`-pinned session reads the
+same content from cache at a fraction of the price (~$0.03), so the tax is paid once per session,
+not once per voice interaction. `--safe-mode` and `--bare` were both evaluated and rejected:
+`--safe-mode` kills skill discovery entirely (breaks Component 13), `--bare` additionally requires
+`ANTHROPIC_API_KEY` and can't use the subscription OAuth session at all.
 
 **Session pinning, not `--continue`**: `--continue` resumes "the most recent session for this
 cwd" — a heuristic that breaks the moment the user also runs `claude` interactively in the same
@@ -343,8 +358,9 @@ Given the ask to keep it visually nice, not just functional:
 
 ## Open items carried into the implementation plan
 
-- Exact `stream-json` schema validation, including the `init` event's `session_id` field and
-  `--resume` behavior with image-bearing turns (blocking task #1).
+- ~~Exact `stream-json` schema validation, including the `init` event's `session_id` field and
+  `--resume` behavior with image-bearing turns~~ — **resolved**, see Component 7 and
+  `waypoint/docs/stream-json-findings.md`.
 - Confirm AppIndicator GNOME extension is active on this machine before building tray code.
   Pop!_OS 24.04 ships COSMIC (Rust, not GNOME-based) as its **default** session — GNOME is an
   optional session you select at the login screen. Re-confirm `$XDG_SESSION_TYPE` and

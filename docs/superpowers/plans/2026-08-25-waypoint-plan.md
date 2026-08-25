@@ -1119,7 +1119,7 @@ def test_build_claude_command_without_session_id_bootstraps():
     cmd = build_claude_command(session_id=None, model="sonnet")
     assert cmd == [
         "claude", "--input-format", "stream-json", "--output-format", "stream-json",
-        "--model", "sonnet",
+        "--model", "sonnet", "--strict-mcp-config",
     ]
     assert "--resume" not in cmd
     assert "--continue" not in cmd
@@ -1130,6 +1130,7 @@ def test_build_claude_command_with_session_id_pins_via_resume():
     assert "--resume" in cmd
     assert cmd[cmd.index("--resume") + 1] == "abc123"
     assert "--continue" not in cmd
+    assert "--strict-mcp-config" in cmd
 
 
 def test_extract_session_id_reads_real_fixture():
@@ -1232,8 +1233,13 @@ class SessionStore:
 def build_claude_command(session_id: Optional[str], model: str) -> list[str]:
     """Bootstrap (session_id is None): plain new session, no --resume,
     no --continue. Pinned (session_id is set): --resume explicitly.
-    Never --continue - see spec Component 7 for why."""
-    cmd = ["claude", "--input-format", "stream-json", "--output-format", "stream-json", "--model", model]
+    Never --continue - see spec Component 7 for why. --strict-mcp-config
+    drops the user's unrelated MCP servers (Jira/Gmail/Grafana/etc.) with
+    no functional downside (spec Component 7, stream-json spike)."""
+    cmd = [
+        "claude", "--input-format", "stream-json", "--output-format", "stream-json",
+        "--model", model, "--strict-mcp-config",
+    ]
     if session_id:
         cmd += ["--resume", session_id]
     return cmd
