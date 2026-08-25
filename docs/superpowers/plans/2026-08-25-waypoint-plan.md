@@ -1,4 +1,4 @@
-# Clicky Linux Port Implementation Plan
+# Waypoint Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12, PyGObject (GTK4 + libadwaita + AppIndicator3), `python-xlib`, `mss`, `sounddevice`, `faster-whisper`, `piper-tts`, `pytest`.
 
-**Spec:** `docs/superpowers/specs/2026-08-25-clicky-linux-port-design.md`
+**Spec:** `docs/superpowers/specs/2026-08-25-waypoint-design.md`
 
 ## Global Constraints
 
@@ -18,16 +18,16 @@
 - Session pinning uses `--resume <session_id>` captured from the CLI's `init` event — never `--continue` (spec Component 7).
 - Default hotkey `ctrl+alt`, user-reconfigurable (spec Component 3).
 - Annotation auto-fade default 4s (spec Component 9).
-- All code lives under `linux-port/` in this repo (`AnttonioAzevedo/clicky-cc`), alongside the existing `leanring-buddy/` (Swift, untouched) and `worker/` (Cloudflare, not used by this port).
+- All code lives under `waypoint/` in this repo (`AnttonioAzevedo/clicky-cc`), alongside the existing `leanring-buddy/` (Swift, untouched) and `worker/` (Cloudflare, not used by this port).
 
 ---
 
 ## File Structure
 
 ```
-linux-port/
+waypoint/
   pyproject.toml
-  clicky_linux/
+  waypoint/
     __init__.py
     config.py            # paths, constants (Task 3)
     state_machine.py      # CompanionController + queue (Task 4)
@@ -60,34 +60,34 @@ linux-port/
         SKILL.md            # Component 13 (Task 16)
 ```
 
-`linux-port/.claude/skills/teaching-mode/SKILL.md` is the file the `claude` CLI subprocess discovers via its `cwd` — the app's subprocess `cwd` is set to `linux-port/` (Task 10).
+`waypoint/.claude/skills/teaching-mode/SKILL.md` is the file the `claude` CLI subprocess discovers via its `cwd` — the app's subprocess `cwd` is set to `waypoint/` (Task 10).
 
 ---
 
 ### Task 1: Project scaffolding
 
 **Files:**
-- Create: `linux-port/pyproject.toml`
-- Create: `linux-port/clicky_linux/__init__.py`
-- Create: `linux-port/tests/__init__.py`
+- Create: `waypoint/pyproject.toml`
+- Create: `waypoint/waypoint/__init__.py`
+- Create: `waypoint/tests/__init__.py`
 
 **Interfaces:**
-- Produces: an installable `clicky_linux` package and a `pytest`-discoverable `tests/` directory that every later task builds on.
+- Produces: an installable `waypoint` package and a `pytest`-discoverable `tests/` directory that every later task builds on.
 
 - [ ] **Step 1: Create the package directories**
 
 ```bash
-mkdir -p /home/tony/projects/clicky-cc/linux-port/clicky_linux
-mkdir -p /home/tony/projects/clicky-cc/linux-port/tests
-touch /home/tony/projects/clicky-cc/linux-port/clicky_linux/__init__.py
-touch /home/tony/projects/clicky-cc/linux-port/tests/__init__.py
+mkdir -p /home/tony/projects/clicky-cc/waypoint/waypoint
+mkdir -p /home/tony/projects/clicky-cc/waypoint/tests
+touch /home/tony/projects/clicky-cc/waypoint/waypoint/__init__.py
+touch /home/tony/projects/clicky-cc/waypoint/tests/__init__.py
 ```
 
 - [ ] **Step 2: Write `pyproject.toml`**
 
 ```toml
 [project]
-name = "clicky-linux"
+name = "waypoint"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
@@ -109,7 +109,7 @@ testpaths = ["tests"]
 - [ ] **Step 3: Install in editable mode and verify pytest runs**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pip install -e ".[dev]"
+cd /home/tony/projects/clicky-cc/waypoint && pip install -e ".[dev]"
 pytest --collect-only
 ```
 
@@ -118,7 +118,7 @@ Expected: exits 0, "no tests ran" (no test files yet).
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/pyproject.toml linux-port/clicky_linux/__init__.py linux-port/tests/__init__.py && git commit -m "chore: scaffold linux-port Python package"
+cd /home/tony/projects/clicky-cc && git add waypoint/pyproject.toml waypoint/waypoint/__init__.py waypoint/tests/__init__.py && git commit -m "chore: scaffold waypoint Python package"
 ```
 
 ---
@@ -128,8 +128,8 @@ cd /home/tony/projects/clicky-cc && git add linux-port/pyproject.toml linux-port
 This is investigative, not implementation, but its output (a fixture file) is a real deliverable Task 10 depends on.
 
 **Files:**
-- Create: `linux-port/tests/fixtures/stream_json_init_event.json`
-- Create: `linux-port/docs/stream-json-findings.md`
+- Create: `waypoint/tests/fixtures/stream_json_init_event.json`
+- Create: `waypoint/docs/stream-json-findings.md`
 
 **Interfaces:**
 - Produces: `tests/fixtures/stream_json_init_event.json` — a real captured `init` event, used by Task 10's tests to keep `extract_session_id()` honest against the actual schema instead of an assumed one.
@@ -137,7 +137,7 @@ This is investigative, not implementation, but its output (a fixture file) is a 
 - [ ] **Step 1: Run a minimal `claude` CLI call and capture stdout**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port
+cd /home/tony/projects/clicky-cc/waypoint
 echo '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"say hi"}]}}' | \
   claude --input-format stream-json --output-format stream-json --model sonnet > /tmp/claude_stream_output.jsonl
 cat /tmp/claude_stream_output.jsonl
@@ -148,13 +148,13 @@ cat /tmp/claude_stream_output.jsonl
 Find the line where `"type":"system"` and `"subtype":"init"` (or equivalent — confirm exact field names from the actual output, do not assume). Save that one JSON line as the fixture:
 
 ```bash
-grep '"subtype":"init"' /tmp/claude_stream_output.jsonl > linux-port/tests/fixtures/stream_json_init_event.json
+grep '"subtype":"init"' /tmp/claude_stream_output.jsonl > waypoint/tests/fixtures/stream_json_init_event.json
 ```
 
 - [ ] **Step 3: Confirm `--resume <session_id>` works on a second call**
 
 ```bash
-SESSION_ID=$(python3 -c "import json; print(json.load(open('linux-port/tests/fixtures/stream_json_init_event.json'))['session_id'])")
+SESSION_ID=$(python3 -c "import json; print(json.load(open('waypoint/tests/fixtures/stream_json_init_event.json'))['session_id'])")
 echo '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"what did I just say?"}]}}' | \
   claude --input-format stream-json --output-format stream-json --model sonnet --resume "$SESSION_ID"
 ```
@@ -168,7 +168,7 @@ Send one turn with an `{"type": "image", "source": {"type": "base64", "media_typ
 - [ ] **Step 5: Write findings**
 
 ```bash
-cat > linux-port/docs/stream-json-findings.md <<'EOF'
+cat > waypoint/docs/stream-json-findings.md <<'EOF'
 # stream-json schema findings
 
 Captured against: `claude --version` = <fill in actual output>
@@ -183,7 +183,7 @@ EOF
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/tests/fixtures/stream_json_init_event.json linux-port/docs/stream-json-findings.md && git commit -m "docs: capture stream-json schema findings from validation spike"
+cd /home/tony/projects/clicky-cc && git add waypoint/tests/fixtures/stream_json_init_event.json waypoint/docs/stream-json-findings.md && git commit -m "docs: capture stream-json schema findings from validation spike"
 ```
 
 **If findings contradict the spec's assumed field names**, update `claude_session.py`'s `extract_session_id()` in Task 10 accordingly — the fixture is the source of truth from here on, not the spec prose.
@@ -193,10 +193,10 @@ cd /home/tony/projects/clicky-cc && git add linux-port/tests/fixtures/stream_jso
 ### Task 3: Config module
 
 **Files:**
-- Create: `linux-port/clicky_linux/config.py`
+- Create: `waypoint/waypoint/config.py`
 
 **Interfaces:**
-- Produces: `CLICKY_HOME`, `CURRENT_SESSION_FILE`, `MEMORY_DIR`, `MEMORY_INDEX_FILE`, `MAX_TOKEN_BUDGET`, `COMPACT_TRIGGER`, `KEEP_RECENT`, `DEFAULT_HOTKEY`, `ANNOTATION_FADE_SECONDS`, `SESSION_END_IDLE_SECONDS` — used by Tasks 4, 7, 9, 10, 15, 19, 20.
+- Produces: `WAYPOINT_HOME`, `CURRENT_SESSION_FILE`, `MEMORY_DIR`, `MEMORY_INDEX_FILE`, `MAX_TOKEN_BUDGET`, `COMPACT_TRIGGER`, `KEEP_RECENT`, `DEFAULT_HOTKEY`, `ANNOTATION_FADE_SECONDS`, `SESSION_END_IDLE_SECONDS` — used by Tasks 4, 7, 9, 10, 15, 19, 20.
 
 No test here — this is pure constants, exercised indirectly by every module that imports it.
 
@@ -205,9 +205,9 @@ No test here — this is pure constants, exercised indirectly by every module th
 ```python
 from pathlib import Path
 
-CLICKY_HOME = Path.home() / ".clicky"
-CURRENT_SESSION_FILE = CLICKY_HOME / "current_session.json"
-MEMORY_DIR = CLICKY_HOME / "memory"
+WAYPOINT_HOME = Path.home() / ".waypoint"
+CURRENT_SESSION_FILE = WAYPOINT_HOME / "current_session.json"
+MEMORY_DIR = WAYPOINT_HOME / "memory"
 MEMORY_INDEX_FILE = MEMORY_DIR / "MEMORY.md"
 
 # Component 10 (spec)
@@ -230,7 +230,7 @@ SESSION_END_IDLE_SECONDS = 600
 - [ ] **Step 2: Verify it imports cleanly**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && python3 -c "from clicky_linux import config; print(config.MAX_TOKEN_BUDGET)"
+cd /home/tony/projects/clicky-cc/waypoint && python3 -c "from waypoint import config; print(config.MAX_TOKEN_BUDGET)"
 ```
 
 Expected: prints `250000`.
@@ -238,7 +238,7 @@ Expected: prints `250000`.
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/config.py && git commit -m "feat: add config module with paths and Component 10 budget constants"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/config.py && git commit -m "feat: add config module with paths and Component 10 budget constants"
 ```
 
 ---
@@ -246,8 +246,8 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/config.py &&
 ### Task 4: State machine + request queue (Components 14)
 
 **Files:**
-- Create: `linux-port/clicky_linux/state_machine.py`
-- Test: `linux-port/tests/test_state_machine.py`
+- Create: `waypoint/waypoint/state_machine.py`
+- Test: `waypoint/tests/test_state_machine.py`
 
 **Interfaces:**
 - Produces: `CompanionState` (enum: `IDLE`, `LISTENING`, `PROCESSING`, `RESPONDING`), `CompanionController` with `on_hotkey_press()`, `on_hotkey_release(audio_buffer: bytes)`, `start_responding()`, `finish_turn() -> bytes | None`. `finish_turn()`'s return value (next buffer or `None`) is what Task 20's app loop uses to decide whether to immediately start the next turn.
@@ -255,8 +255,8 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/config.py &&
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# linux-port/tests/test_state_machine.py
-from clicky_linux.state_machine import CompanionController, CompanionState
+# waypoint/tests/test_state_machine.py
+from waypoint.state_machine import CompanionController, CompanionState
 
 
 def test_starts_idle():
@@ -312,15 +312,15 @@ def test_finish_turn_drains_queue_in_order():
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pytest tests/test_state_machine.py -v
+cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_state_machine.py -v
 ```
 
-Expected: FAIL with `ModuleNotFoundError: No module named 'clicky_linux.state_machine'`.
+Expected: FAIL with `ModuleNotFoundError: No module named 'waypoint.state_machine'`.
 
 - [ ] **Step 3: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/state_machine.py
+# waypoint/waypoint/state_machine.py
 from collections import deque
 from enum import Enum, auto
 from typing import Optional
@@ -372,7 +372,7 @@ class CompanionController:
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pytest tests/test_state_machine.py -v
+cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_state_machine.py -v
 ```
 
 Expected: 6 passed.
@@ -380,7 +380,7 @@ Expected: 6 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/state_machine.py linux-port/tests/test_state_machine.py && git commit -m "feat: add CompanionController state machine with request queue"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/state_machine.py waypoint/tests/test_state_machine.py && git commit -m "feat: add CompanionController state machine with request queue"
 ```
 
 ---
@@ -388,8 +388,8 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/state_machin
 ### Task 5: Model routing (Component 15)
 
 **Files:**
-- Create: `linux-port/clicky_linux/model_routing.py`
-- Test: `linux-port/tests/test_model_routing.py`
+- Create: `waypoint/waypoint/model_routing.py`
+- Test: `waypoint/tests/test_model_routing.py`
 
 **Interfaces:**
 - Consumes: nothing (pure function over a string).
@@ -398,8 +398,8 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/state_machin
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# linux-port/tests/test_model_routing.py
-from clicky_linux.model_routing import resolve_model
+# waypoint/tests/test_model_routing.py
+from waypoint.model_routing import resolve_model
 
 
 def test_explicit_fast_phrase_wins():
@@ -436,7 +436,7 @@ def test_never_auto_escalates_to_opus():
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pytest tests/test_model_routing.py -v
+cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_model_routing.py -v
 ```
 
 Expected: FAIL, module not found.
@@ -444,7 +444,7 @@ Expected: FAIL, module not found.
 - [ ] **Step 3: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/model_routing.py
+# waypoint/waypoint/model_routing.py
 MODEL_HAIKU = "haiku"
 MODEL_SONNET = "sonnet"
 MODEL_OPUS = "opus"
@@ -485,7 +485,7 @@ def resolve_model(transcript: str) -> str:
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pytest tests/test_model_routing.py -v
+cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_model_routing.py -v
 ```
 
 Expected: 7 passed.
@@ -493,7 +493,7 @@ Expected: 7 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/model_routing.py linux-port/tests/test_model_routing.py && git commit -m "feat: add model routing (explicit phrase, heuristic fallback)"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/model_routing.py waypoint/tests/test_model_routing.py && git commit -m "feat: add model routing (explicit phrase, heuristic fallback)"
 ```
 
 ---
@@ -501,8 +501,8 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/model_routin
 ### Task 6: Tag parsing and stripping (Component 9 logic)
 
 **Files:**
-- Create: `linux-port/clicky_linux/tags.py`
-- Test: `linux-port/tests/test_tags.py`
+- Create: `waypoint/waypoint/tags.py`
+- Test: `waypoint/tests/test_tags.py`
 
 **Interfaces:**
 - Produces: `PointTag`, `HighlightTag`, `AnnotateTag` dataclasses, `parse_tags(text: str) -> list[PointTag | HighlightTag | AnnotateTag]`, `strip_tags(text: str) -> str`. Used by Task 19 (overlay rendering) and Task 20 (stripping before TTS/memory per spec).
@@ -510,8 +510,8 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/model_routin
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# linux-port/tests/test_tags.py
-from clicky_linux.tags import parse_tags, strip_tags, PointTag, HighlightTag, AnnotateTag
+# waypoint/tests/test_tags.py
+from waypoint.tags import parse_tags, strip_tags, PointTag, HighlightTag, AnnotateTag
 
 
 def test_parse_point_tag():
@@ -558,7 +558,7 @@ def test_strip_tags_no_tags_returns_original_trimmed():
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pytest tests/test_tags.py -v
+cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_tags.py -v
 ```
 
 Expected: FAIL, module not found.
@@ -566,7 +566,7 @@ Expected: FAIL, module not found.
 - [ ] **Step 3: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/tags.py
+# waypoint/waypoint/tags.py
 import re
 from dataclasses import dataclass, field
 from typing import Union
@@ -634,7 +634,7 @@ def strip_tags(text: str) -> str:
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pytest tests/test_tags.py -v
+cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_tags.py -v
 ```
 
 Expected: 8 passed.
@@ -642,7 +642,7 @@ Expected: 8 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/tags.py linux-port/tests/test_tags.py && git commit -m "feat: add POINT/HIGHLIGHT/ANNOTATE tag parsing and stripping"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/tags.py waypoint/tests/test_tags.py && git commit -m "feat: add POINT/HIGHLIGHT/ANNOTATE tag parsing and stripping"
 ```
 
 ---
@@ -650,8 +650,8 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/tags.py linu
 ### Task 7: ContextManager compaction (Component 10)
 
 **Files:**
-- Create: `linux-port/clicky_linux/context_manager.py`
-- Test: `linux-port/tests/test_context_manager.py`
+- Create: `waypoint/waypoint/context_manager.py`
+- Test: `waypoint/tests/test_context_manager.py`
 
 **Interfaces:**
 - Consumes: `config.MAX_TOKEN_BUDGET`, `config.COMPACT_TRIGGER`, `config.KEEP_RECENT` (Task 3).
@@ -660,9 +660,9 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/tags.py linu
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# linux-port/tests/test_context_manager.py
+# waypoint/tests/test_context_manager.py
 import pytest
-from clicky_linux.context_manager import ContextManager, Turn
+from waypoint.context_manager import ContextManager, Turn
 
 
 def test_should_compact_false_when_under_trigger():
@@ -751,7 +751,7 @@ def test_compact_fallback_never_raises():
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pytest tests/test_context_manager.py -v
+cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_context_manager.py -v
 ```
 
 Expected: FAIL, module not found.
@@ -759,11 +759,11 @@ Expected: FAIL, module not found.
 - [ ] **Step 3: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/context_manager.py
+# waypoint/waypoint/context_manager.py
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from clicky_linux.config import MAX_TOKEN_BUDGET, COMPACT_TRIGGER, KEEP_RECENT
+from waypoint.config import MAX_TOKEN_BUDGET, COMPACT_TRIGGER, KEEP_RECENT
 
 
 @dataclass
@@ -824,7 +824,7 @@ class ContextManager:
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pytest tests/test_context_manager.py -v
+cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_context_manager.py -v
 ```
 
 Expected: 7 passed.
@@ -832,7 +832,7 @@ Expected: 7 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/context_manager.py linux-port/tests/test_context_manager.py && git commit -m "feat: add ContextManager token-budget compaction (ported from flicky)"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/context_manager.py waypoint/tests/test_context_manager.py && git commit -m "feat: add ContextManager token-budget compaction (ported from flicky)"
 ```
 
 ---
@@ -840,8 +840,8 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/context_mana
 ### Task 8: Ollama vision-model detection (Component 11)
 
 **Files:**
-- Create: `linux-port/clicky_linux/ollama_fallback.py`
-- Test: `linux-port/tests/test_ollama_fallback.py`
+- Create: `waypoint/waypoint/ollama_fallback.py`
+- Test: `waypoint/tests/test_ollama_fallback.py`
 
 **Interfaces:**
 - Produces: `VISION_FAMILIES: list[str]`, `is_vision_model(model_name: str) -> bool`, `pick_vision_model(available_models: list[str]) -> str | None`. Used by Task 20's app loop when the `claude` CLI subprocess fails.
@@ -849,8 +849,8 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/context_mana
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# linux-port/tests/test_ollama_fallback.py
-from clicky_linux.ollama_fallback import is_vision_model, pick_vision_model
+# waypoint/tests/test_ollama_fallback.py
+from waypoint.ollama_fallback import is_vision_model, pick_vision_model
 
 
 def test_is_vision_model_matches_known_families():
@@ -881,7 +881,7 @@ def test_pick_vision_model_returns_none_if_no_vision_model_available():
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pytest tests/test_ollama_fallback.py -v
+cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_ollama_fallback.py -v
 ```
 
 Expected: FAIL, module not found.
@@ -889,7 +889,7 @@ Expected: FAIL, module not found.
 - [ ] **Step 3: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/ollama_fallback.py
+# waypoint/waypoint/ollama_fallback.py
 # Ported from flicky's ollama-api.ts isVisionModel() family list (spec
 # Component 11) - Ollama doesn't self-report vision capability, so
 # detection is by name-family match.
@@ -917,7 +917,7 @@ def pick_vision_model(available_models: list[str]) -> str | None:
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pytest tests/test_ollama_fallback.py -v
+cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_ollama_fallback.py -v
 ```
 
 Expected: 5 passed.
@@ -925,7 +925,7 @@ Expected: 5 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/ollama_fallback.py linux-port/tests/test_ollama_fallback.py && git commit -m "feat: add Ollama vision-model family detection (ported from flicky)"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/ollama_fallback.py waypoint/tests/test_ollama_fallback.py && git commit -m "feat: add Ollama vision-model family detection (ported from flicky)"
 ```
 
 ---
@@ -933,8 +933,8 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/ollama_fallb
 ### Task 9: Memory index and session recall matching (Component 12)
 
 **Files:**
-- Create: `linux-port/clicky_linux/memory.py`
-- Test: `linux-port/tests/test_memory.py`
+- Create: `waypoint/waypoint/memory.py`
+- Test: `waypoint/tests/test_memory.py`
 
 **Interfaces:**
 - Consumes: `config.MEMORY_DIR`, `config.MEMORY_INDEX_FILE` (Task 3).
@@ -943,10 +943,10 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/ollama_fallb
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# linux-port/tests/test_memory.py
+# waypoint/tests/test_memory.py
 from pathlib import Path
 
-from clicky_linux.memory import MemoryEntry, parse_memory_index, format_entry, append_entry, find_best_match
+from waypoint.memory import MemoryEntry, parse_memory_index, format_entry, append_entry, find_best_match
 
 
 def test_format_entry_matches_spec_format():
@@ -1008,7 +1008,7 @@ def test_find_best_match_returns_none_when_no_overlap():
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pytest tests/test_memory.py -v
+cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_memory.py -v
 ```
 
 Expected: FAIL, module not found.
@@ -1016,7 +1016,7 @@ Expected: FAIL, module not found.
 - [ ] **Step 3: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/memory.py
+# waypoint/waypoint/memory.py
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -1070,7 +1070,7 @@ def find_best_match(entries: list[MemoryEntry], query: str) -> MemoryEntry | Non
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pytest tests/test_memory.py -v
+cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_memory.py -v
 ```
 
 Expected: 7 passed.
@@ -1078,7 +1078,7 @@ Expected: 7 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/memory.py linux-port/tests/test_memory.py && git commit -m "feat: add cross-session memory index and recall matching"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/memory.py waypoint/tests/test_memory.py && git commit -m "feat: add cross-session memory index and recall matching"
 ```
 
 ---
@@ -1086,8 +1086,8 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/memory.py li
 ### Task 10: Claude session client — session pinning (Component 7)
 
 **Files:**
-- Create: `linux-port/clicky_linux/claude_session.py`
-- Test: `linux-port/tests/test_claude_session.py`
+- Create: `waypoint/waypoint/claude_session.py`
+- Test: `waypoint/tests/test_claude_session.py`
 
 **Interfaces:**
 - Consumes: `config.CURRENT_SESSION_FILE` (Task 3), the `init` event fixture from Task 2 (`tests/fixtures/stream_json_init_event.json`).
@@ -1096,11 +1096,11 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/memory.py li
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# linux-port/tests/test_claude_session.py
+# waypoint/tests/test_claude_session.py
 import json
 from pathlib import Path
 
-from clicky_linux.claude_session import SessionStore, build_claude_command, extract_session_id, ClaudeSessionClient
+from waypoint.claude_session import SessionStore, build_claude_command, extract_session_id, ClaudeSessionClient
 
 
 def test_session_store_read_returns_none_when_file_missing(tmp_path):
@@ -1196,7 +1196,7 @@ def test_run_turn_uses_pinned_session_id_on_subsequent_call(tmp_path):
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pytest tests/test_claude_session.py -v
+cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_claude_session.py -v
 ```
 
 Expected: FAIL, module not found.
@@ -1204,7 +1204,7 @@ Expected: FAIL, module not found.
 - [ ] **Step 3: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/claude_session.py
+# waypoint/waypoint/claude_session.py
 import json
 import subprocess
 from pathlib import Path
@@ -1269,7 +1269,7 @@ class ClaudeSessionClient:
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port && pytest tests/test_claude_session.py -v
+cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_claude_session.py -v
 ```
 
 Expected: 7 passed. **If Task 2's findings showed different field names** (e.g. `session_id` nested under a different key), fix `extract_session_id()` and the corresponding test now, before moving on.
@@ -1277,7 +1277,7 @@ Expected: 7 passed. **If Task 2's findings showed different field names** (e.g. 
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/claude_session.py linux-port/tests/test_claude_session.py && git commit -m "feat: add ClaudeSessionClient with explicit session_id pinning"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/claude_session.py waypoint/tests/test_claude_session.py && git commit -m "feat: add ClaudeSessionClient with explicit session_id pinning"
 ```
 
 ---
@@ -1285,7 +1285,7 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/claude_sessi
 ### Task 11: Screen capture (Component 4)
 
 **Files:**
-- Create: `linux-port/clicky_linux/screen_capture.py`
+- Create: `waypoint/waypoint/screen_capture.py`
 
 **Interfaces:**
 - Produces: `ScreenshotResult` dataclass (`screen_index: int`, `media_type: str`, `base64_data: str`), `capture_all_screens() -> list[ScreenshotResult]`. Used by Task 20's app loop to build Claude image content blocks.
@@ -1295,7 +1295,7 @@ No unit test — `mss` requires a real X11 display. Manual verification only, pe
 - [ ] **Step 1: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/screen_capture.py
+# waypoint/waypoint/screen_capture.py
 import base64
 from dataclasses import dataclass
 
@@ -1332,9 +1332,9 @@ def capture_all_screens() -> list[ScreenshotResult]:
 - [ ] **Step 2: Manual verification**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port
+cd /home/tony/projects/clicky-cc/waypoint
 python3 -c "
-from clicky_linux.screen_capture import capture_all_screens
+from waypoint.screen_capture import capture_all_screens
 results = capture_all_screens()
 for r in results:
     print(r.screen_index, r.media_type, len(r.base64_data), 'bytes b64')
@@ -1346,7 +1346,7 @@ Expected: one line per connected monitor, on the real Pop!_OS X11 session, with 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/screen_capture.py && git commit -m "feat: add multi-monitor X11 screenshot capture via mss"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/screen_capture.py && git commit -m "feat: add multi-monitor X11 screenshot capture via mss"
 ```
 
 ---
@@ -1354,7 +1354,7 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/screen_captu
 ### Task 12: Mic capture (Component 5)
 
 **Files:**
-- Create: `linux-port/clicky_linux/audio_capture.py`
+- Create: `waypoint/waypoint/audio_capture.py`
 
 **Interfaces:**
 - Produces: `MicRecorder` with `start() -> None`, `stop() -> bytes` (returns raw PCM16 mono bytes). Used by Task 20's app loop, feeding Task 13's `Transcriber`.
@@ -1364,7 +1364,7 @@ No unit test — requires a real audio device. Manual verification only.
 - [ ] **Step 1: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/audio_capture.py
+# waypoint/waypoint/audio_capture.py
 import numpy as np
 import sounddevice as sd
 
@@ -1407,10 +1407,10 @@ class MicRecorder:
 - [ ] **Step 2: Manual verification**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port
+cd /home/tony/projects/clicky-cc/waypoint
 python3 -c "
 import time
-from clicky_linux.audio_capture import MicRecorder
+from waypoint.audio_capture import MicRecorder
 r = MicRecorder()
 r.start()
 print('recording 2s, say something...')
@@ -1425,7 +1425,7 @@ Expected: non-zero byte count roughly matching `2 seconds * 16000 samplerate * 2
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/audio_capture.py && git commit -m "feat: add push-to-talk mic capture via sounddevice"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/audio_capture.py && git commit -m "feat: add push-to-talk mic capture via sounddevice"
 ```
 
 ---
@@ -1433,7 +1433,7 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/audio_captur
 ### Task 13: Speech-to-text (Component 6)
 
 **Files:**
-- Create: `linux-port/clicky_linux/stt.py`
+- Create: `waypoint/waypoint/stt.py`
 
 **Interfaces:**
 - Consumes: `MicRecorder.stop()`'s output (Task 12, raw PCM16 bytes).
@@ -1444,7 +1444,7 @@ No unit test — depends on a downloaded Whisper model and real audio. Manual ve
 - [ ] **Step 1: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/stt.py
+# waypoint/waypoint/stt.py
 import numpy as np
 from faster_whisper import WhisperModel
 
@@ -1466,11 +1466,11 @@ class Transcriber:
 - [ ] **Step 2: Manual verification**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port
+cd /home/tony/projects/clicky-cc/waypoint
 python3 -c "
 import time
-from clicky_linux.audio_capture import MicRecorder
-from clicky_linux.stt import Transcriber
+from waypoint.audio_capture import MicRecorder
+from waypoint.stt import Transcriber
 
 r = MicRecorder()
 r.start()
@@ -1488,7 +1488,7 @@ Expected: a reasonably accurate transcript of what was said. Note the model down
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/stt.py && git commit -m "feat: add faster-whisper STT wrapper"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/stt.py && git commit -m "feat: add faster-whisper STT wrapper"
 ```
 
 ---
@@ -1496,7 +1496,7 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/stt.py && gi
 ### Task 14: Text-to-speech (Component 8)
 
 **Files:**
-- Create: `linux-port/clicky_linux/tts.py`
+- Create: `waypoint/waypoint/tts.py`
 
 **Interfaces:**
 - Consumes: `tags.strip_tags()`'s output (Task 6) — text passed in should already have tags stripped.
@@ -1507,7 +1507,7 @@ No unit test — spawns a real subprocess and plays real audio. Manual verificat
 - [ ] **Step 1: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/tts.py
+# waypoint/waypoint/tts.py
 import subprocess
 
 import numpy as np
@@ -1545,9 +1545,9 @@ class PiperTTS:
 Requires a downloaded Piper PT-BR voice model (e.g. `pt_BR-faber-medium.onnx`).
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port
+cd /home/tony/projects/clicky-cc/waypoint
 python3 -c "
-from clicky_linux.tts import PiperTTS
+from waypoint.tts import PiperTTS
 tts = PiperTTS(model_path='/path/to/pt_BR-faber-medium.onnx')
 tts.speak('Oi, isso é um teste de voz.')
 "
@@ -1558,7 +1558,7 @@ Expected: audible PT-BR speech through the default audio output.
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/tts.py && git commit -m "feat: add Piper TTS subprocess wrapper"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/tts.py && git commit -m "feat: add Piper TTS subprocess wrapper"
 ```
 
 ---
@@ -1566,7 +1566,7 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/tts.py && gi
 ### Task 15: Global push-to-talk hotkey (Component 3)
 
 **Files:**
-- Create: `linux-port/clicky_linux/hotkey.py`
+- Create: `waypoint/waypoint/hotkey.py`
 
 **Interfaces:**
 - Produces: `HotkeyListener` with `start(on_press: Callable[[], None], on_release: Callable[[], None]) -> None`, `stop() -> None`, `set_binding(binding: str) -> None`. Used by Task 18 (panel settings UI) and Task 20 (app wiring).
@@ -1576,7 +1576,7 @@ No unit test — `XGrabKey` requires a live X11 display and root window access. 
 - [ ] **Step 1: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/hotkey.py
+# waypoint/waypoint/hotkey.py
 from typing import Callable, Optional
 
 from Xlib import X, XK
@@ -1643,9 +1643,9 @@ class HotkeyListener:
 - [ ] **Step 2: Manual verification**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port
+cd /home/tony/projects/clicky-cc/waypoint
 python3 -c "
-from clicky_linux.hotkey import HotkeyListener
+from waypoint.hotkey import HotkeyListener
 listener = HotkeyListener(binding='ctrl+alt')
 listener.start(on_press=lambda: print('PRESS'), on_release=lambda: print('RELEASE'))
 "
@@ -1656,7 +1656,7 @@ Expected: pressing and releasing Ctrl+Alt on the real Pop!_OS X11 session prints
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/hotkey.py && git commit -m "feat: add configurable global push-to-talk hotkey via python-xlib"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/hotkey.py && git commit -m "feat: add configurable global push-to-talk hotkey via python-xlib"
 ```
 
 ---
@@ -1664,23 +1664,23 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/hotkey.py &&
 ### Task 16: Teaching-mode skill file (Component 13)
 
 **Files:**
-- Create: `linux-port/.claude/skills/teaching-mode/SKILL.md`
+- Create: `waypoint/.claude/skills/teaching-mode/SKILL.md`
 
 **Interfaces:**
 - Consumes: the tag syntax defined in Task 6 (`POINT`/`HIGHLIGHT`/`ANNOTATE`).
-- Produces: a file discovered automatically by the `claude` CLI subprocess (Task 10) when its `cwd` is `linux-port/`. No code interface — this is the "system prompt" for the app.
+- Produces: a file discovered automatically by the `claude` CLI subprocess (Task 10) when its `cwd` is `waypoint/`. No code interface — this is the "system prompt" for the app.
 
 - [ ] **Step 1: Write the skill file**
 
 ```markdown
 ---
 name: teaching-mode
-description: Persona and screen-annotation tag syntax for Clicky, a voice-driven screen companion. Always active for this app - not a user-invoked skill.
+description: Persona and screen-annotation tag syntax for Waypoint, a voice-driven screen companion. Always active for this app - not a user-invoked skill.
 ---
 
 # Teaching-mode persona
 
-You are Clicky, a friendly companion that lives beside the user's cursor. You see their
+You are Waypoint, a friendly companion that lives beside the user's cursor. You see their
 screen, hear their voice, and respond both in text (spoken aloud via TTS) and by drawing
 directly on their screen. Speak like a patient teacher sitting next to them, not like a
 generic assistant: explain what you're pointing at as you point at it, keep responses
@@ -1716,7 +1716,7 @@ use this index to recognize what they mean - the app handles the actual session 
 - [ ] **Step 2: Verify discovery**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port
+cd /home/tony/projects/clicky-cc/waypoint
 echo '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"quem é você?"}]}}' | \
   claude --input-format stream-json --output-format stream-json --model sonnet
 ```
@@ -1726,7 +1726,7 @@ Expected: the response reflects the teaching-mode persona (mentions pointing/scr
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/.claude/skills/teaching-mode/SKILL.md && git commit -m "feat: add teaching-mode skill defining persona and tag syntax"
+cd /home/tony/projects/clicky-cc && git add waypoint/.claude/skills/teaching-mode/SKILL.md && git commit -m "feat: add teaching-mode skill defining persona and tag syntax"
 ```
 
 ---
@@ -1734,7 +1734,7 @@ cd /home/tony/projects/clicky-cc && git add linux-port/.claude/skills/teaching-m
 ### Task 17: Tray icon (Component 1)
 
 **Files:**
-- Create: `linux-port/clicky_linux/tray.py`
+- Create: `waypoint/waypoint/tray.py`
 
 **Interfaces:**
 - Produces: `TrayIcon` with `__init__(on_click: Callable[[], None])`, `run() -> None`. Used by Task 20 (app wiring).
@@ -1744,7 +1744,7 @@ No unit test — `AppIndicator3` requires a live GNOME session. Manual verificat
 - [ ] **Step 1: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/tray.py
+# waypoint/waypoint/tray.py
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -1762,7 +1762,7 @@ class TrayIcon:
     def __init__(self, on_click: Callable[[], None]):
         self._on_click = on_click
         self._indicator = AppIndicator3.Indicator.new(
-            "clicky-linux",
+            "waypoint",
             "utilities-terminal",  # placeholder icon name; swap for a real asset
             AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
         )
@@ -1783,9 +1783,9 @@ class TrayIcon:
 - [ ] **Step 2: Manual verification**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port
+cd /home/tony/projects/clicky-cc/waypoint
 python3 -c "
-from clicky_linux.tray import TrayIcon
+from waypoint.tray import TrayIcon
 icon = TrayIcon(on_click=lambda: print('clicked'))
 icon.run()
 "
@@ -1796,7 +1796,7 @@ Expected: an icon appears in the GNOME top bar (requires `gnome-shell-extension-
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/tray.py && git commit -m "feat: add AppIndicator3 tray icon"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/tray.py && git commit -m "feat: add AppIndicator3 tray icon"
 ```
 
 ---
@@ -1804,7 +1804,7 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/tray.py && g
 ### Task 18: Companion panel (Component 2)
 
 **Files:**
-- Create: `linux-port/clicky_linux/panel.py`
+- Create: `waypoint/waypoint/panel.py`
 
 **Interfaces:**
 - Consumes: `HotkeyListener.set_binding()` (Task 15), for the hotkey-reconfiguration UI.
@@ -1815,7 +1815,7 @@ No unit test — GTK4 windowing requires a live display. Manual verification onl
 - [ ] **Step 1: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/panel.py
+# waypoint/waypoint/panel.py
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -1870,14 +1870,14 @@ class CompanionPanel(Gtk.Window):
 - [ ] **Step 2: Manual verification**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port
+cd /home/tony/projects/clicky-cc/waypoint
 python3 -c "
 import gi
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk
-from clicky_linux.panel import CompanionPanel
+from waypoint.panel import CompanionPanel
 
-app = Gtk.Application(application_id='dev.clicky.linux')
+app = Gtk.Application(application_id='dev.waypoint.linux')
 def on_activate(app):
     panel = CompanionPanel(on_hotkey_rebind=lambda b: print('rebind', b))
     app.add_window(panel)
@@ -1892,7 +1892,7 @@ Expected: a dark, borderless, rounded panel window appears showing "Segure Ctrl+
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/panel.py && git commit -m "feat: add companion panel GTK4/libadwaita window"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/panel.py && git commit -m "feat: add companion panel GTK4/libadwaita window"
 ```
 
 ---
@@ -1900,7 +1900,7 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/panel.py && 
 ### Task 19: Cursor / annotation overlay rendering (Component 9 rendering)
 
 **Files:**
-- Create: `linux-port/clicky_linux/overlay.py`
+- Create: `waypoint/waypoint/overlay.py`
 
 **Interfaces:**
 - Consumes: `tags.PointTag`, `tags.HighlightTag`, `tags.AnnotateTag` (Task 6), `config.ANNOTATION_FADE_SECONDS` (Task 3).
@@ -1911,14 +1911,14 @@ No unit test — Cairo drawing on a live X11 overlay window. Manual verification
 - [ ] **Step 1: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/overlay.py
+# waypoint/waypoint/overlay.py
 import gi
 
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, GLib  # noqa: E402
 
-from clicky_linux.config import ANNOTATION_FADE_SECONDS
-from clicky_linux.tags import PointTag, HighlightTag, AnnotateTag, Tag
+from waypoint.config import ANNOTATION_FADE_SECONDS
+from waypoint.tags import PointTag, HighlightTag, AnnotateTag, Tag
 
 
 class AnnotationOverlay(Gtk.Window):
@@ -1990,15 +1990,15 @@ class AnnotationOverlay(Gtk.Window):
 - [ ] **Step 2: Manual verification**
 
 ```bash
-cd /home/tony/projects/clicky-cc/linux-port
+cd /home/tony/projects/clicky-cc/waypoint
 python3 -c "
 import gi
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk
-from clicky_linux.overlay import AnnotationOverlay
-from clicky_linux.tags import PointTag, HighlightTag
+from waypoint.overlay import AnnotationOverlay
+from waypoint.tags import PointTag, HighlightTag
 
-app = Gtk.Application(application_id='dev.clicky.overlay')
+app = Gtk.Application(application_id='dev.waypoint.overlay')
 def on_activate(app):
     overlay = AnnotationOverlay(screen_index=0)
     app.add_window(overlay)
@@ -2015,7 +2015,7 @@ Expected: a blue dot at (200,200) and a rectangle ring at (400,300,150x60) rende
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/overlay.py && git commit -m "feat: add cursor/annotation overlay rendering with Cairo"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/overlay.py && git commit -m "feat: add cursor/annotation overlay rendering with Cairo"
 ```
 
 ---
@@ -2023,7 +2023,7 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/overlay.py &
 ### Task 20: App wiring (main entrypoint)
 
 **Files:**
-- Create: `linux-port/clicky_linux/app.py`
+- Create: `waypoint/waypoint/app.py`
 
 **Interfaces:**
 - Consumes: every module from Tasks 3-19.
@@ -2034,32 +2034,32 @@ This task is integration glue, not new pure logic — no new unit tests, verifie
 - [ ] **Step 1: Write the implementation**
 
 ```python
-# linux-port/clicky_linux/app.py
+# waypoint/waypoint/app.py
 import time
 from pathlib import Path
 
-from clicky_linux.config import (
+from waypoint.config import (
     CURRENT_SESSION_FILE, MEMORY_INDEX_FILE, MEMORY_DIR,
     DEFAULT_HOTKEY, SESSION_END_IDLE_SECONDS,
 )
-from clicky_linux.state_machine import CompanionController
-from clicky_linux.audio_capture import MicRecorder
-from clicky_linux.stt import Transcriber
-from clicky_linux.screen_capture import capture_all_screens
-from clicky_linux.model_routing import resolve_model
-from clicky_linux.claude_session import ClaudeSessionClient, SessionStore
-from clicky_linux.context_manager import ContextManager
-from clicky_linux.ollama_fallback import pick_vision_model
-from clicky_linux.tags import parse_tags, strip_tags
-from clicky_linux.memory import MemoryEntry, append_entry, parse_memory_index, find_best_match
-from clicky_linux.tts import PiperTTS
-from clicky_linux.hotkey import HotkeyListener
-from clicky_linux.tray import TrayIcon
-from clicky_linux.panel import CompanionPanel
-from clicky_linux.overlay import AnnotationOverlay
+from waypoint.state_machine import CompanionController
+from waypoint.audio_capture import MicRecorder
+from waypoint.stt import Transcriber
+from waypoint.screen_capture import capture_all_screens
+from waypoint.model_routing import resolve_model
+from waypoint.claude_session import ClaudeSessionClient, SessionStore
+from waypoint.context_manager import ContextManager
+from waypoint.ollama_fallback import pick_vision_model
+from waypoint.tags import parse_tags, strip_tags
+from waypoint.memory import MemoryEntry, append_entry, parse_memory_index, find_best_match
+from waypoint.tts import PiperTTS
+from waypoint.hotkey import HotkeyListener
+from waypoint.tray import TrayIcon
+from waypoint.panel import CompanionPanel
+from waypoint.overlay import AnnotationOverlay
 
 
-class ClickyApp:
+class WaypointApp:
     """Wires every component together per the spec's Data flow section.
     Each step below is numbered to match that section directly."""
 
@@ -2070,7 +2070,7 @@ class ClickyApp:
         self.session_store = SessionStore(CURRENT_SESSION_FILE)
         self.claude_client = ClaudeSessionClient(self.session_store)
         self.context_manager = ContextManager()
-        self.tts = PiperTTS(model_path="~/.clicky/models/pt_BR-faber-medium.onnx")
+        self.tts = PiperTTS(model_path="~/.waypoint/models/pt_BR-faber-medium.onnx")
         self.overlays: list[AnnotationOverlay] = []
         self._last_activity = time.monotonic()
 
@@ -2186,7 +2186,7 @@ class ClickyApp:
 
 
 def run_app() -> None:
-    app = ClickyApp()
+    app = WaypointApp()
     hotkey = HotkeyListener(binding=DEFAULT_HOTKEY)
     tray = TrayIcon(on_click=lambda: None)
     hotkey.start(on_press=app.on_hotkey_press, on_release=app.on_hotkey_release)
@@ -2201,12 +2201,12 @@ if __name__ == "__main__":
 
 - [ ] **Step 2: Manual end-to-end verification**
 
-On the real Pop!_OS X11 session: run `python3 -m clicky_linux.app`, press and hold Ctrl+Alt, ask a question about something on screen, release. Confirm: transcript captured, screenshot sent, Claude response streamed, any `POINT`/`HIGHLIGHT`/`ANNOTATE` tags rendered on the overlay, response spoken via Piper, and a second hotkey press while still responding gets queued and processed after.
+On the real Pop!_OS X11 session: run `python3 -m waypoint.app`, press and hold Ctrl+Alt, ask a question about something on screen, release. Confirm: transcript captured, screenshot sent, Claude response streamed, any `POINT`/`HIGHLIGHT`/`ANNOTATE` tags rendered on the overlay, response spoken via Piper, and a second hotkey press while still responding gets queued and processed after.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/app.py && git commit -m "feat: wire full push-to-talk pipeline in ClickyApp"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/app.py && git commit -m "feat: wire full push-to-talk pipeline in WaypointApp"
 ```
 
 ---
@@ -2214,8 +2214,8 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/app.py && gi
 ### Task 21: UI polish pass
 
 **Files:**
-- Modify: `linux-port/clicky_linux/panel.py`
-- Modify: `linux-port/clicky_linux/overlay.py`
+- Modify: `waypoint/waypoint/panel.py`
+- Modify: `waypoint/waypoint/overlay.py`
 
 **Interfaces:**
 - No new interfaces — this task only refines the visual behavior already wired in Tasks 18-20.
@@ -2235,7 +2235,7 @@ Run the full app (Task 20's Step 2 flow) and confirm: waveform bars animate whil
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/panel.py linux-port/clicky_linux/overlay.py && git commit -m "polish: add waveform view and fade transitions to panel/overlay"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/panel.py waypoint/waypoint/overlay.py && git commit -m "polish: add waveform view and fade transitions to panel/overlay"
 ```
 
 ---
@@ -2253,7 +2253,7 @@ cd /home/tony/projects/clicky-cc && git add linux-port/clicky_linux/panel.py lin
 
 ## Execution Handoff
 
-Plan complete and saved to `docs/superpowers/plans/2026-08-25-clicky-linux-port-plan.md`. Two execution options:
+Plan complete and saved to `docs/superpowers/plans/2026-08-25-waypoint-plan.md`. Two execution options:
 
 **1. Subagent-Driven (recommended)** — I dispatch a fresh subagent per task, review between tasks, fast iteration.
 

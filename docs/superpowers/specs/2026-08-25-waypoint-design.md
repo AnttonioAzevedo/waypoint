@@ -1,4 +1,4 @@
-# Clicky Linux Port — Design Spec
+# Waypoint — Design Spec
 
 ## Context
 
@@ -11,6 +11,13 @@ This fork (`AnttonioAzevedo/clicky-cc`) targets **Pop!_OS 24.04, X11 session, GN
 (confirmed via `$XDG_SESSION_TYPE` / `lsb_release`). Goal: rebuild the same interaction loop
 —hotkey → listen → screenshot → Claude → speak → point— fully local and free, reusing the
 original Swift code only as behavioral reference, not as source to port.
+
+**Naming**: the resulting app is called **Waypoint**. It started as a straight Linux port and
+stayed a fork of Clicky in fact — MIT license, credited above, behavioral reference throughout
+this doc — but diverged enough in scope (cross-session memory with recall, a request queue,
+model routing, an Ollama resilience fallback — none of which exist in the original) that calling
+it "Clicky for Linux" undersells what it does. Fork lineage stays visible in this Context
+section and in the repo's README credit; the product name doesn't need to carry it.
 
 A parallel project, [pango07/flicky](https://github.com/pango07/flicky), reimplements Clicky
 as a cross-platform Electron app with paid multi-provider API keys (Anthropic/OpenAI +
@@ -40,7 +47,7 @@ local CLI subprocess.
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
-│  clicky-linux (Python process)                                      │
+│  waypoint (Python process)                                      │
 │                                                                       │
 │  ┌────────────┐  ┌──────────────┐  ┌────────────────────┐          │
 │  │ Tray icon  │  │ Hotkey        │  │ Companion panel     │          │
@@ -128,13 +135,13 @@ cwd" — a heuristic that breaks the moment the user also runs `claude` interact
 project directory (which this app's `cwd` necessarily is, for Component 13's skill discovery).
 Two sessions would fight over the "most recent" slot. Instead: the `init` event on the first
 `stream-json` response of any session carries a `session_id`. The app captures and persists it
-to `~/.clicky/current_session.json`, and every subsequent call passes `--resume <session_id>`
+to `~/.waypoint/current_session.json`, and every subsequent call passes `--resume <session_id>`
 explicitly. This pins the app to its own session regardless of what else runs `claude` in that
 directory — no separate `cwd`, no symlink, no duplication. See Component 12 for how this
 `session_id` is also used for session recall and Component 10 for how it's replaced on
 compaction.
 
-**Bootstrap**: if `~/.clicky/current_session.json` doesn't exist yet (first-ever run, or right
+**Bootstrap**: if `~/.waypoint/current_session.json` doesn't exist yet (first-ever run, or right
 after a compaction/session-end reset it, per Component 10), the CLI is spawned with neither
 `--resume` nor `--continue` — a plain new session. Its `init` event's `session_id` is what gets
 written to `current_session.json` for the first time, and every call after that pins to it as
@@ -187,7 +194,7 @@ code, from Flicky's
   started (no `--resume`, no `--continue`; we don't control the CLI's internal session file
   directly, so "fresh" has to mean an actual new session, not a resumed one), seeded with the
   summary as its first turn. Its new `session_id` (Component 7) replaces the pinned one in
-  `~/.clicky/current_session.json`. The old session's full history isn't lost — it stays
+  `~/.waypoint/current_session.json`. The old session's full history isn't lost — it stays
   resumable by ID via the recall mechanism in Component 12.
 - **Fallback if summarization itself fails**: don't block the interaction — drop the oldest
   half of the non-recent turns verbatim and continue. Never let a compaction failure block a
@@ -210,8 +217,8 @@ restart) and not something we're inheriting on purpose.
 
 - On session end (idle timeout, app shutdown, or compaction per Component 10), the
   `ContextManager`'s current summary (or a fresh summarize call if the session was short) is
-  written to `~/.clicky/memory/YYYY-MM-DD-<topic-slug>.md`.
-- A `~/.clicky/memory/MEMORY.md` index is updated alongside it, **one line per session,
+  written to `~/.waypoint/memory/YYYY-MM-DD-<topic-slug>.md`.
+- A `~/.waypoint/memory/MEMORY.md` index is updated alongside it, **one line per session,
   including that session's `session_id`** so it can be resumed later, e.g.:
   ```
   - [2026-08-20] session_id=abc123 — Discutindo migração do worker Cloudflare
@@ -227,7 +234,7 @@ restart) and not something we're inheriting on purpose.
 every session, it can recognize when the user is asking to return to a past topic. This is
 handled as an app-level intent, not left to prose — a recognized recall request triggers the
 app to match the request against `MEMORY.md` entries (fuzzy match, or asking the current Claude
-turn to pick the matching entry) and, on a match, swap `~/.clicky/current_session.json`'s
+turn to pick the matching entry) and, on a match, swap `~/.waypoint/current_session.json`'s
 pinned `session_id` (Component 7) to that entry's ID. The old session's full history is intact
 in the CLI's own session store — nothing was deleted, only which ID is currently pinned
 changes. Switching back later is the same mechanism in reverse.
