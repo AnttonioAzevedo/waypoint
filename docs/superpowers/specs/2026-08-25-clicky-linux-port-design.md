@@ -27,6 +27,10 @@ reusing (see Components 10 and 11), not as a dependency or fork target.
 - No packaging/distribution (`.deb`, Flatpak) — local dev run is enough for v1.
 - No multi-provider key management (Flicky's core feature) — this app has zero API keys by
   design; Ollama (Component 11) is a local resilience fallback, not a provider picker.
+- No full-duplex/continuous voice mode (ChatGPT-app-style always-listening + barge-in
+  interruption of TTS) in this pass — v1 stays push-to-talk with a request queue (Component 14).
+  Full-duplex is a materially different interaction model (VAD, continuous mic capture,
+  TTS-interrupt-on-speech) and belongs in its own spec once v1 is running, not folded in here.
 
 ## Architecture
 
@@ -67,6 +71,10 @@ local CLI subprocess.
 
 .claude/skills/teaching-mode/SKILL.md ─── discovered by the CLI via cwd,
 defines tone + exact tag syntax the model should emit (Component 13).
+
+Hotkey press while non-idle → Request queue (Component 14, deque), drained on return to idle.
+Transcript → Model routing (Component 15) resolves --model before the CLI spawn.
+CLI spawn always uses --resume <pinned session_id> (Component 7), never --continue.
 ```
 
 ## Components
@@ -109,19 +117,28 @@ functional contract (`OpenAIAudioTranscriptionProvider.swift` is the closest exi
 precedent: buffer-then-upload, except now buffer-then-local-transcribe).
 
 ### 7. Chat — `claude` CLI subprocess (Claude Code, user's Pro/Max subscription)
-Spawned via `subprocess.Popen` with `--input-format stream-json --output-format stream-json`,
-**with `--continue`** so the CLI's own session carries the conversation instead of us resending
-full history (and every past image) on each call — this replaces the "stateless, full history
-resent" decision from the previous draft. Content blocks (image + text) built in the same shape
-the original `ClaudeAPI.swift` already constructs (`{"type": "image", "source": {"type":
-"base64", "media_type": ..., "data": ...}}` + text block), fed over stdin as NDJSON. Output
-NDJSON parsed for token deltas, re-emitted as progressive text chunks to the UI — replicating
-the `onTextChunk` streaming callback contract.
+Spawned via `subprocess.Popen` with `--input-format stream-json --output-format stream-json`.
+Content blocks (image + text) built in the same shape the original `ClaudeAPI.swift` already
+constructs (`{"type": "image", "source": {"type": "base64", "media_type": ..., "data": ...}}` +
+text block), fed over stdin as NDJSON. Output NDJSON parsed for token deltas, re-emitted as
+progressive text chunks to the UI — replicating the `onTextChunk` streaming callback contract.
+
+**Session pinning, not `--continue`**: `--continue` resumes "the most recent session for this
+cwd" — a heuristic that breaks the moment the user also runs `claude` interactively in the same
+project directory (which this app's `cwd` necessarily is, for Component 13's skill discovery).
+Two sessions would fight over the "most recent" slot. Instead: the `init` event on the first
+`stream-json` response of any session carries a `session_id`. The app captures and persists it
+to `~/.clicky/current_session.json`, and every subsequent call passes `--resume <session_id>`
+explicitly. This pins the app to its own session regardless of what else runs `claude` in that
+directory — no separate `cwd`, no symlink, no duplication. See Component 12 for how this
+`session_id` is also used for session recall and Component 10 for how it's replaced on
+compaction.
 
 **Validation spike required before implementation**: confirm the exact current `stream-json`
-schema for image content blocks and the token-delta event shape, and confirm `--continue`
-behavior with image-bearing turns, against the installed `claude` CLI version — do not assume
-the schema from memory. First task of the implementation plan.
+schema for image content blocks, the `init` event's `session_id` field, and the token-delta
+event shape, and confirm `--resume` behavior with image-bearing turns, against the installed
+`claude` CLI version — do not assume the schema from memory. First task of the implementation
+plan.
 
 ### 8. TTS — `piper-tts` (local, subprocess)
 Piper over ElevenLabs — meaningfully better quality than `espeak`/`festival`, fully offline,
@@ -150,16 +167,22 @@ conversation memory (same rule the original app already applies to `[POINT:...]`
 still followed in Flicky's `companion-manager.ts`).
 
 ### 10. ContextManager — token-budget compaction (within a live session)
-`--continue` (Component 7) means the CLI holds history, but a long-running session can still
-grow past a usable context size. Ported as an **algorithm**, not code, from Flicky's
+Session pinning via `--resume` (Component 7) means the CLI holds history across turns, but a
+long-running session can still grow past a usable context size. Ported as an **algorithm**, not
+code, from Flicky's
 `context-manager.ts` (TypeScript, not reusable directly, but the design is sound):
 
 - `MAX_TOKEN_BUDGET = 250_000`, `COMPACT_TRIGGER = 200_000`, `KEEP_RECENT = 10` exchanges.
 - Approximate token count via `len(text) // 4` unless the CLI reports exact usage.
 - On crossing the trigger: everything older than the recent window gets summarized in one call
-  (folding in any prior summary — a rolling summary, never summary-of-summary chains), the
-  compacted turns are dropped, and a fresh `--resume` session is started seeded with the
-  summary as the first turn (since we don't control the CLI's internal session file directly).
+  (folding in any prior summary — a rolling summary, never summary-of-summary chains). The
+  current session is then closed out — distilled to a memory `.md` file and indexed in
+  `MEMORY.md` (Component 12), same as any session end — and a genuinely **new** session is
+  started (no `--resume`, no `--continue`; we don't control the CLI's internal session file
+  directly, so "fresh" has to mean an actual new session, not a resumed one), seeded with the
+  summary as its first turn. Its new `session_id` (Component 7) replaces the pinned one in
+  `~/.clicky/current_session.json`. The old session's full history isn't lost — it stays
+  resumable by ID via the recall mechanism in Component 12.
 - **Fallback if summarization itself fails**: don't block the interaction — drop the oldest
   half of the non-recent turns verbatim and continue. Never let a compaction failure block a
   response the user is waiting on.
@@ -174,19 +197,34 @@ This is a **degraded-mode fallback**, not a configuration option the user picks 
 Claude via subscription is always the primary path. Detected and logged, never silent: the
 panel shows "using local fallback model" so response-quality differences aren't a mystery.
 
-### 12. Cross-session memory — `.md` files, injected via skill/system prompt
+### 12. Cross-session memory — `.md` files + session index, injected via skill/system prompt
 Solves "Clicky forgets everything when the app closes" — true of the original app
 (`CompanionManager.swift` caps `conversationHistory` at 10 in-memory exchanges, lost on
 restart) and not something we're inheriting on purpose.
 
-- On idle timeout or app shutdown, the `ContextManager`'s current summary (or a fresh summarize
-  call if the session was short) is written to `~/.clicky/memory/YYYY-MM-DD-<topic-slug>.md`.
-- A `~/.clicky/memory/MEMORY.md` index (one line per file, like `- [2026-08-25] Discussing the
-  Linux port design`) is updated alongside it — kept short on purpose, this is what gets loaded
-  every session start, not the full memory files.
+- On session end (idle timeout, app shutdown, or compaction per Component 10), the
+  `ContextManager`'s current summary (or a fresh summarize call if the session was short) is
+  written to `~/.clicky/memory/YYYY-MM-DD-<topic-slug>.md`.
+- A `~/.clicky/memory/MEMORY.md` index is updated alongside it, **one line per session,
+  including that session's `session_id`** so it can be resumed later, e.g.:
+  ```
+  - [2026-08-20] session_id=abc123 — Discutindo migração do worker Cloudflare
+  - [2026-08-25] session_id=def456 — Design do port Linux
+  ```
+  Kept short on purpose — this is what gets loaded every session start, not the full memory
+  files.
 - On next app start, `MEMORY.md`'s content is prepended to the `claude` CLI's system prompt (or
   read via the teaching-mode skill, Component 13) so the model has continuity across restarts
   without resending full transcripts or images from prior days.
+
+**Session recall ("volta naquele papo sobre X")**: since the model sees the `MEMORY.md` index
+every session, it can recognize when the user is asking to return to a past topic. This is
+handled as an app-level intent, not left to prose — a recognized recall request triggers the
+app to match the request against `MEMORY.md` entries (fuzzy match, or asking the current Claude
+turn to pick the matching entry) and, on a match, swap `~/.clicky/current_session.json`'s
+pinned `session_id` (Component 7) to that entry's ID. The old session's full history is intact
+in the CLI's own session store — nothing was deleted, only which ID is currently pinned
+changes. Switching back later is the same mechanism in reverse.
 
 ### 13. Teaching-mode skill — `.claude/skills/teaching-mode/SKILL.md`
 Since the app's `claude` CLI subprocess always runs with its `cwd` set to the app's working
@@ -201,6 +239,28 @@ file documents, in the format Claude Code already understands:
 
 This replaces a large hardcoded system-prompt string in Python with a versioned, human-editable
 file — the natural place to tune "teacher personality" without touching application code.
+
+### 14. Request queue — handling a hotkey press mid-turn
+The state machine (`idle → listening → processing → responding → idle`) is a single-turn cycle;
+it doesn't say what happens if the hotkey is pressed again before returning to `idle`. Rather
+than ignore the press or cancel the in-flight turn, it's enqueued: a `collections.deque` holds
+pending push-to-talk buffers, drained one at a time as the controller returns to `idle`. Keeps
+push-to-talk strictly turn-based (see the full-duplex non-goal above) while still capturing
+everything the user says, in order — no dropped input, no overlapping audio/overlay state.
+
+### 15. Model routing — explicit command, heuristic fallback
+`claude` CLI's `--model` flag lets each spawn (Component 7) pick Sonnet/Opus/Haiku per turn.
+Priority order:
+1. **Explicit voice command** — the transcribed text is checked for a routing phrase first
+   (e.g. "modo rápido" → Haiku, "pensa com calma nisso" → Opus) before anything else runs. A
+   small fixed phrase table, not a model call — cheap and unambiguous.
+2. **Heuristic fallback** — if no explicit phrase is present, a lightweight rule set picks the
+   model from the request shape (short/factual → Haiku, "explica"/"analisa"/"compara" → Sonnet
+   default, nothing auto-escalates to Opus without the explicit phrase — it's the expensive
+   tier, opt-in only).
+
+Both layers are pure functions over the transcript text, easy to unit test in isolation
+(Testing section already covers this class of logic).
 
 ## UI polish
 
@@ -220,21 +280,28 @@ Given the ask to keep it visually nice, not just functional:
 
 ## Data flow (one interaction)
 
-1. Hotkey press (user-configured binding) → state → `listening`, mic capture starts, waveform
-   begins drawing.
+1. Hotkey press (user-configured binding) → if controller isn't `idle`, buffer is enqueued
+   (Component 14) instead of starting a new turn. Otherwise: state → `listening`, mic capture
+   starts, waveform begins drawing.
 2. Hotkey release → mic buffer closed → `faster-whisper` transcribes → text.
 3. Screenshot(s) captured (`mss`) for all connected monitors.
-4. `ContextManager` checks token budget; compacts if over `COMPACT_TRIGGER` (Component 10).
-5. `claude` CLI spawned with `--continue`, image(s) + transcript + system prompt (teaching-mode
-   skill + `MEMORY.md` context already resident via cwd) → state → `processing`. On subprocess
-   failure, Ollama fallback (Component 11) is attempted before surfacing an error.
-6. Streamed text deltas → panel/overlay bubble updates progressively → state → `responding`.
-7. On completion: `[POINT:...]` / `[HIGHLIGHT:...]` / `[ANNOTATE:...]` tags parsed → overlay
+4. Transcript checked for a model-routing phrase (Component 15) → resolves which `--model` this
+   turn uses.
+5. `ContextManager` checks token budget; compacts if over `COMPACT_TRIGGER` (Component 10, which
+   also handles session-recall requests by swapping the pinned `session_id`).
+6. `claude` CLI spawned with `--resume <pinned session_id>` (Component 7), image(s) + transcript
+   + system prompt (teaching-mode skill + `MEMORY.md` context already resident via cwd) → state
+   → `processing`. On subprocess failure, Ollama fallback (Component 11) is attempted before
+   surfacing an error.
+7. Streamed text deltas → panel/overlay bubble updates progressively → state → `responding`.
+8. On completion: `[POINT:...]` / `[HIGHLIGHT:...]` / `[ANNOTATE:...]` tags parsed → overlay
    draws/animates accordingly; tags stripped before TTS and before the turn is recorded.
-8. Full response text → `piper-tts` → audio playback → `is_playing` drives waveform/cursor
+9. Full response text → `piper-tts` → audio playback → `is_playing` drives waveform/cursor
    state until done.
-9. Idle timeout (transient mode) → overlay fades out; if idle crosses the session-end threshold,
-   Component 12's memory distillation runs in the background.
+10. Controller returns to `idle`; if the queue (Component 14) has pending buffers, the next one
+    starts immediately from step 4. Otherwise: idle timeout (transient mode) → overlay fades
+    out; if idle crosses the session-end threshold, Component 12's memory distillation runs in
+    the background.
 
 ## Error handling
 
@@ -253,8 +320,9 @@ Given the ask to keep it visually nice, not just functional:
 ## Testing
 
 - Unit: NDJSON parsing (chat deltas), tag parsing (`POINT`/`HIGHLIGHT`/`ANNOTATE`), audio buffer
-  conversion, `ContextManager` compaction trigger/fallback logic, vision-model family matching —
-  all pure functions, easy to isolate.
+  conversion, `ContextManager` compaction trigger/fallback logic, vision-model family matching,
+  model-routing phrase/heuristic resolution (Component 15), request queue drain order
+  (Component 14) — all pure functions, easy to isolate.
 - Integration: mock `claude`/`ollama`/`piper` subprocesses to test the state machine transitions
   and the CLI→Ollama fallback path without needing the real CLI/model each run.
 - Manual: full push-to-talk round trip on the actual Pop!_OS X11 session before calling any
@@ -262,9 +330,12 @@ Given the ask to keep it visually nice, not just functional:
 
 ## Open items carried into the implementation plan
 
-- Exact `stream-json` schema validation, including `--continue` behavior with image-bearing
-  turns (blocking task #1).
+- Exact `stream-json` schema validation, including the `init` event's `session_id` field and
+  `--resume` behavior with image-bearing turns (blocking task #1).
 - Confirm AppIndicator GNOME extension is active on this machine before building tray code.
 - Whisper/Piper model size vs. quality trade-off — pick default, document override.
 - Confirm at least one vision-capable Ollama model is realistically runnable on this machine
   before treating Component 11 as anything but a documented no-op fallback.
+- Model-routing phrase table (Component 15) — finalize the exact PT-BR trigger phrases and
+  their model mapping before implementation; the ones in this spec are illustrative.
+- Full-duplex/continuous voice mode (see Non-goals) — separate future spec, not scoped here.
