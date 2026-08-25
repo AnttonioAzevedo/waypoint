@@ -1,0 +1,18 @@
+[project]
+name = "waypoint"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "PyGObject>=3.48",
+    "python-xlib>=0.33",
+    "mss>=9.0",
+    "sounddevice>=0.4",
+    "numpy>=1.26",
+    "faster-whisper>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
