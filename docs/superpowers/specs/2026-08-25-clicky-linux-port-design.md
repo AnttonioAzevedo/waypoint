@@ -134,6 +134,12 @@ directory — no separate `cwd`, no symlink, no duplication. See Component 12 fo
 `session_id` is also used for session recall and Component 10 for how it's replaced on
 compaction.
 
+**Bootstrap**: if `~/.clicky/current_session.json` doesn't exist yet (first-ever run, or right
+after a compaction/session-end reset it, per Component 10), the CLI is spawned with neither
+`--resume` nor `--continue` — a plain new session. Its `init` event's `session_id` is what gets
+written to `current_session.json` for the first time, and every call after that pins to it as
+described above.
+
 **Validation spike required before implementation**: confirm the exact current `stream-json`
 schema for image content blocks, the `init` event's `session_id` field, and the token-delta
 event shape, and confirm `--resume` behavior with image-bearing turns, against the installed
@@ -339,3 +345,7 @@ Given the ask to keep it visually nice, not just functional:
 - Model-routing phrase table (Component 15) — finalize the exact PT-BR trigger phrases and
   their model mapping before implementation; the ones in this spec are illustrative.
 - Full-duplex/continuous voice mode (see Non-goals) — separate future spec, not scoped here.
+- Session-end idle threshold (Component 12, Data flow step 10) — the value that triggers memory
+  distillation isn't picked yet. Distinct from the 1s overlay-fade timing (UI polish), which is
+  already specified; this one is presumably minutes, not seconds — pick a default and document
+  it before implementation.
