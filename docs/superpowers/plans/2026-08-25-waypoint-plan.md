@@ -6,7 +6,7 @@
 
 **Architecture:** Single main Python process (GTK4 + libadwaita UI: panel, overlay) plus one small GTK3 subprocess for the tray icon (AppIndicator3 forces GTK3, incompatible in-process with GTK4 - see Task 17), talking over a local Unix socket. Pure-logic modules (state machine, tag parsing, context compaction, model routing, memory index, vision-family matching) are dependency-injected and unit tested; hardware/subprocess-facing modules (audio, screen, STT, TTS, the `claude` CLI itself, GTK windows) are integration/manual tested per the spec's own Testing section.
 
-**Tech Stack:** Python 3.12, PyGObject (GTK4 + libadwaita + AppIndicator3), `python-xlib`, `mss`, `sounddevice`, `faster-whisper`, `piper-tts`, `pytest`.
+**Tech Stack:** Python 3.12, PyGObject (GTK4 + libadwaita + AppIndicator3), `pynput`, `mss`, `sounddevice`, `faster-whisper`, `piper-tts`, `pytest`.
 
 **Spec:** `docs/superpowers/specs/2026-08-25-waypoint-design.md`
 
@@ -93,11 +93,12 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "PyGObject>=3.48",
-    "python-xlib>=0.33",
+    "pynput>=1.8",
     "mss>=9.0",
     "sounddevice>=0.4",
     "numpy>=1.26",
     "faster-whisper>=1.0",
+    "piper-tts>=1.7",
 ]
 
 [project.optional-dependencies]
@@ -1782,12 +1783,28 @@ listener.start(on_press=lambda: print('PRESS'), on_release=lambda: print('RELEAS
 "
 ```
 
-Expected: pressing and releasing Ctrl+Alt on the real Pop!_OS X11 session prints `PRESS`/`RELEASE`. Ctrl+C to stop. **Note**: this needs a real physical key press - XTest synthetic key injection was tried as an automated substitute during implementation and produced no error but also no delivered event (inconclusive on this sandboxed X session). Grab correctness itself (no `BadAccess`, per the fix above) was verified live; the full press/release round trip still needs a human at the keyboard before Task 15 is signed off.
+Expected: pressing and releasing Ctrl+Alt on the real Pop!_OS X11 session prints `PRESS`/`RELEASE`.
+
+**Second revision - this is what actually shipped**: even with the `owner_events` fix above, live
+testing (both a real physical key press from Tony and a synthetic XTest injection) confirmed the
+`XGrabKey`-based grab never actually receives `KeyPress`/`KeyRelease` - only a spurious
+`MappingNotify`. Root cause not fully isolated (GNOME shortcut conflicts were ruled out via
+`gsettings`); `XGrabKey`-based global hotkeys are a known-fragile area across Linux desktop
+environments generally. **Switched to `pynput`** (`pip install pynput`, pulls in `evdev` as a
+transitive dependency) instead of hand-rolled `python-xlib` grabbing. `HotkeyListener` keeps the
+exact same public interface (`start(on_press, on_release)`, `stop()`, `set_binding()`) but tracks
+currently-held keys via `pynput.keyboard.Listener` and fires `on_press()`/`on_release()` once
+every required modifier in the binding is simultaneously held/released - this works because
+`pynput`'s Linux backend uses the X `RECORD` extension, a passive monitoring mechanism that
+doesn't compete with the window manager's own key grabs the way `XGrabKey` does. Verified live,
+both via XTest synthetic injection and a real physical Ctrl+Alt press/release from Tony: reliably
+fires `PRESS`/`RELEASE`. The `python-xlib`-based implementation above (Step 1's code block) was
+never actually shipped - see `waypoint/waypoint/hotkey.py` for the real, working version.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/hotkey.py && git commit -m "feat: add configurable global push-to-talk hotkey via python-xlib"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/hotkey.py waypoint/pyproject.toml && git commit -m "fix: replace XGrabKey with pynput for global hotkey capture"
 ```
 
 ---

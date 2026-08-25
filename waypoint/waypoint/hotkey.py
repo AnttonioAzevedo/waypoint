@@ -1,103 +1,84 @@
+"""Component 3: global push-to-talk hotkey.
+
+**Revised during implementation**: the original design used raw
+`python-xlib` `XGrabKey`. Verified live on a real GNOME/Pop!_OS 24.04
+session that this doesn't reliably work: even after fixing a real
+`owner_events` bug and confirming no GNOME shortcut conflict (checked
+via `gsettings`), neither a real physical key press nor a synthetic
+XTest key event ever reached the grab - only a spurious
+`MappingNotify`, never `KeyPress`/`KeyRelease`. Root cause not fully
+isolated, but `XGrabKey`-based global hotkeys are a known-fragile area
+across Linux desktop environments. Switched to `pynput`, a
+battle-tested library for exactly this: verified live that its
+listener (backed by the X `RECORD` extension, a passive monitoring
+mechanism rather than an exclusive grab - it doesn't compete with the
+window manager's own shortcuts the way `XGrabKey` does) correctly
+receives both real and XTest-synthetic key events.
+"""
 from typing import Callable, Optional
 
-from Xlib import X, XK
-from Xlib.display import Display
+from pynput import keyboard
 
-# Modifier name -> Xlib modifier mask
-_MODIFIER_MASKS = {
-    "ctrl": X.ControlMask,
-    "alt": X.Mod1Mask,
-    "shift": X.ShiftMask,
-    "super": X.Mod4Mask,
-}
-
-# Modifier name -> the keysym of its own physical key, used when the
-# whole binding is modifier-only (e.g. "ctrl+alt" has no letter key).
-_MODIFIER_OWN_KEYSYMS = {
-    "ctrl": XK.XK_Control_L,
-    "alt": XK.XK_Alt_L,
-    "shift": XK.XK_Shift_L,
-    "super": XK.XK_Super_L,
+# Modifier name -> the set of pynput Key values that count as "this
+# modifier", since pynput reports left/right variants separately
+# (e.g. Key.ctrl_l vs Key.ctrl_r) but a binding like "ctrl+alt" should
+# match either side.
+_MODIFIER_KEYS: dict[str, set] = {
+    "ctrl": {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r},
+    "alt": {keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r},
+    "shift": {keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r},
+    "super": {keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r},
 }
 
 
-class HotkeyGrabError(RuntimeError):
-    """Raised when XGrabKey fails - most commonly because another
-    client (the window manager, another app) already holds a grab on
-    the same keycode+modifier combination. python-xlib delivers this as
-    an async X protocol error (BadAccess), not a Python exception, so
-    start() installs an error handler to catch and raise it explicitly
-    instead of silently doing nothing (a real failure mode found during
-    manual verification against a live GNOME session)."""
-
-
-def _parse_binding(display: Display, binding: str) -> tuple[int, int]:
-    """'ctrl+alt' -> (keycode of the *last* modifier's own key, combined
-    mask of every modifier *except* the last one). Grabbing X.AnyKey
-    with the full combined mask looks equivalent but isn't: it fails
-    with BadAccess the moment any other client has grabbed *any single*
-    keycode under that same modifier mask (e.g. GNOME's own Ctrl+Alt+T
-    or Ctrl+Alt+Left/Right bindings) - a real failure observed against a
-    live GNOME session that a synthetic AnyKey grab is far more likely
-    to collide with than a real physical key."""
-    parts = binding.lower().split("+")
-    *other_parts, last_part = parts
-    mask = 0
-    for part in other_parts:
-        mask |= _MODIFIER_MASKS[part]
-    keysym = _MODIFIER_OWN_KEYSYMS[last_part]
-    keycode = display.keysym_to_keycode(keysym)
-    return keycode, mask
+def _parse_binding(binding: str) -> list[set]:
+    """'ctrl+alt' -> [{ctrl_l, ctrl_r, ctrl}, {alt_l, alt_r, alt}] -
+    one set of acceptable keys per required modifier."""
+    return [_MODIFIER_KEYS[part] for part in binding.lower().split("+")]
 
 
 class HotkeyListener:
+    """Fires on_press() once every required modifier in the binding is
+    held simultaneously (regardless of press order), and on_release()
+    as soon as any of them is released. start() blocks - run it on a
+    background thread (see app.py)."""
+
     def __init__(self, binding: str):
         self.binding = binding
-        self._display: Optional[Display] = None
+        self._required = _parse_binding(binding)
+        self._pressed: set = set()
+        self._active = False
+        self._listener: Optional[keyboard.Listener] = None
         self._on_press: Optional[Callable[[], None]] = None
         self._on_release: Optional[Callable[[], None]] = None
-        self._grab_keycode: Optional[int] = None
-        self._grab_mask: Optional[int] = None
 
     def set_binding(self, binding: str) -> None:
         self.binding = binding
+        self._required = _parse_binding(binding)
 
     def start(self, on_press: Callable[[], None], on_release: Callable[[], None]) -> None:
         self._on_press = on_press
         self._on_release = on_release
-        self._display = Display()
-        root = self._display.screen().root
+        self._listener = keyboard.Listener(on_press=self._handle_press, on_release=self._handle_release)
+        self._listener.start()
+        self._listener.join()
 
-        errors: list[Exception] = []
-        self._display.set_error_handler(lambda err, req=None: errors.append(err))
+    def _all_required_held(self) -> bool:
+        return all(any(key in self._pressed for key in group) for group in self._required)
 
-        keycode, mask = _parse_binding(self._display, self.binding)
-        self._grab_keycode, self._grab_mask = keycode, mask
-        root.grab_key(keycode, mask, True, X.GrabModeAsync, X.GrabModeAsync)
-        self._display.sync()
+    def _handle_press(self, key) -> None:
+        self._pressed.add(key)
+        if not self._active and self._all_required_held():
+            self._active = True
+            self._on_press()
 
-        if errors:
-            self._display.close()
-            self._display = None
-            raise HotkeyGrabError(
-                f"Failed to grab hotkey '{self.binding}' - it's likely already bound by "
-                f"another application (e.g. the window manager). Try a different binding."
-            )
-
-        pressed = False
-        while True:
-            event = self._display.next_event()
-            if event.type == X.KeyPress and not pressed:
-                pressed = True
-                self._on_press()
-            elif event.type == X.KeyRelease and pressed:
-                pressed = False
-                self._on_release()
+    def _handle_release(self, key) -> None:
+        self._pressed.discard(key)
+        if self._active and not self._all_required_held():
+            self._active = False
+            self._on_release()
 
     def stop(self) -> None:
-        if self._display:
-            root = self._display.screen().root
-            if self._grab_keycode is not None:
-                root.ungrab_key(self._grab_keycode, self._grab_mask)
-            self._display.close()
-            self._display = None
+        if self._listener:
+            self._listener.stop()
+            self._listener = None

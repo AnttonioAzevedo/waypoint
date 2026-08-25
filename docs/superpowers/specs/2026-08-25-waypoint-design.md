@@ -54,8 +54,8 @@ local CLI subprocess.
 │  ┌────────────┐  ┌──────────────┐  ┌────────────────────┐          │
 │  │ Tray icon  │  │ Hotkey        │  │ Companion panel     │          │
 │  │ (AppIndi-  │  │ listener      │  │ (Gtk.Window,         │          │
-│  │  cator3)   │  │ (python-xlib, │  │  libadwaita styled)  │          │
-│  │            │  │  configurable)│  │                       │          │
+│  │  cator3,   │  │ (pynput,      │  │  libadwaita styled)  │          │
+│  │  subproc)  │  │  configurable)│  │                       │          │
 │  └─────┬──────┘  └──────┬───────┘  └──────────┬──────────┘          │
 │        │                │                     │                     │
 │        └───────────┬────┴─────────────────────┘                     │
@@ -110,13 +110,24 @@ custom shadow via `Gtk.Overlay` trick since X11 doesn't composite window shadows
 WM) to approximate the original `DesignSystem.swift` dark aesthetic. Click-outside-to-dismiss
 via a global X11 button-press grab while the panel is open.
 
-### 3. Hotkey — `python-xlib`, user-configurable
-Global key-grab via `XGrabKey` on the root window. Default binding is `ctrl+alt` (Linux
-equivalent of the original `ctrl+option`), but the combination is captured and re-registered
-live from the panel settings UI — same idea as Flicky's customizable shortcut capture, applied
-here to close the "confirm keybinding with user" open item from the previous draft: instead of
-hardcoding it, the user picks it once in the UI. Press/release tracked the same way
-`GlobalPushToTalkShortcutMonitor.swift` does — a state transition, not a toggle.
+### 3. Hotkey — `pynput`, user-configurable
+Default binding is `ctrl+alt` (Linux equivalent of the original `ctrl+option`), but the
+combination is captured and re-registered live from the panel settings UI — same idea as
+Flicky's customizable shortcut capture, applied here to close the "confirm keybinding with user"
+open item from the previous draft: instead of hardcoding it, the user picks it once in the UI.
+Press/release tracked the same way `GlobalPushToTalkShortcutMonitor.swift` does — a state
+transition (all required modifiers held → fire; any released → fire release), not a toggle.
+
+**Not raw `XGrabKey` via `python-xlib`, despite that being the original plan**: verified live on
+a real Pop!_OS 24.04/GNOME session that `XGrabKey`-based grabbing doesn't reliably work here —
+neither a real physical key press nor a synthetic XTest-injected one ever reached the grab (only
+a spurious `MappingNotify`), even after fixing a real `owner_events` bug and ruling out a GNOME
+shortcut conflict via `gsettings`. Root cause not fully isolated; `XGrabKey` global hotkeys are a
+known-fragile area across Linux desktop environments in general. Switched to `pynput`, whose
+Linux backend uses the X `RECORD` extension — a passive monitoring mechanism, not an exclusive
+grab, so it doesn't compete with the window manager's own shortcut bindings the way `XGrabKey`
+does. Verified live, both via synthetic XTest injection and a real physical key press: reliably
+fires press/release.
 
 ### 4. Screen capture — `mss`
 `mss` grabs X11 frame buffers directly, no portal negotiation needed on X11 (unlike Wayland).
