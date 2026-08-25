@@ -4,9 +4,9 @@
 
 **Goal:** Rebuild Clicky's push-to-talk → screenshot → Claude → speak → point interaction loop as a Linux-native Python app, fully local/free (Claude Code CLI subscription auth, `faster-whisper` STT, `piper-tts` TTS, Ollama fallback), targeting Pop!_OS 24.04 X11/GNOME.
 
-**Architecture:** Single Python process. GTK4 + libadwaita UI (tray, panel, overlay). Pure-logic modules (state machine, tag parsing, context compaction, model routing, memory index, vision-family matching) are dependency-injected and unit tested; hardware/subprocess-facing modules (audio, screen, STT, TTS, the `claude` CLI itself, GTK windows) are integration/manual tested per the spec's own Testing section.
+**Architecture:** Single main Python process (GTK4 + libadwaita UI: panel, overlay) plus one small GTK3 subprocess for the tray icon (AppIndicator3 forces GTK3, incompatible in-process with GTK4 - see Task 17), talking over a local Unix socket. Pure-logic modules (state machine, tag parsing, context compaction, model routing, memory index, vision-family matching) are dependency-injected and unit tested; hardware/subprocess-facing modules (audio, screen, STT, TTS, the `claude` CLI itself, GTK windows) are integration/manual tested per the spec's own Testing section.
 
-**Tech Stack:** Python 3.12, PyGObject (GTK4 + libadwaita + AppIndicator3), `python-xlib`, `mss`, `sounddevice`, `faster-whisper`, `piper-tts`, `pytest`.
+**Tech Stack:** Python 3.12, PyGObject (GTK4 + libadwaita + AppIndicator3), `pynput`, `mss`, `sounddevice`, `faster-whisper`, `piper-tts`, `pytest`.
 
 **Spec:** `docs/superpowers/specs/2026-08-25-waypoint-design.md`
 
@@ -42,7 +42,8 @@ waypoint/
     stt.py                  # Component 6 (Task 13)
     tts.py                  # Component 8 (Task 14)
     hotkey.py               # Component 3 (Task 15)
-    tray.py                 # Component 1 (Task 17)
+    tray.py                 # Component 1 (Task 17) - main-process side, Unix socket server
+    tray_process.py         # Component 1 (Task 17) - separate GTK3 subprocess, socket client
     panel.py                # Component 2 (Task 18)
     overlay.py              # Component 9 rendering (Task 19)
     app.py                   # wiring (Task 20)
@@ -92,11 +93,12 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "PyGObject>=3.48",
-    "python-xlib>=0.33",
+    "pynput>=1.8",
     "mss>=9.0",
     "sounddevice>=0.4",
     "numpy>=1.26",
     "faster-whisper>=1.0",
+    "piper-tts>=1.7",
 ]
 
 [project.optional-dependencies]
@@ -1090,8 +1092,17 @@ cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/memory.py waypoint
 - Test: `waypoint/tests/test_claude_session.py`
 
 **Interfaces:**
-- Consumes: `config.CURRENT_SESSION_FILE` (Task 3), the `init` event fixture from Task 2 (`tests/fixtures/stream_json_init_event.json`).
-- Produces: `SessionStore` (`read() -> str | None`, `write(session_id: str) -> None`), `build_claude_command(session_id, model) -> list[str]`, `extract_session_id(event: dict) -> str`, `ClaudeSessionClient.run_turn(content_blocks, model) -> Iterator[dict]`. Used by Task 20's app loop.
+- Consumes: `config.CURRENT_SESSION_FILE` (Task 3), the `init` event fixture from Task 2 (`tests/fixtures/stream_json_init_event.json`), the teaching-mode `SKILL.md` body from Task 16.
+- Produces: `SessionStore` (`read() -> str | None`, `write(session_id: str) -> None`), `load_persona(skill_path: Path) -> str` (strips YAML frontmatter), `build_claude_command(session_id, model, system_prompt=None) -> list[str]`, `extract_session_id(event: dict) -> str`, `ClaudeSessionClient(session_store, popen_factory=..., system_prompt=None).run_turn(content_blocks, model) -> Iterator[dict]`. Used by Task 20's app loop.
+
+**Revised during implementation**: the original design assumed Claude Code's cwd-based skill
+discovery would auto-inject the teaching-mode persona (Component 13). Live verification showed
+this is false — discovery only makes a skill *available to invoke*, it doesn't inject content
+automatically; the model answered as the user's own global `CLAUDE.md` persona instead. Fix:
+`load_persona()` reads the skill file directly and the persona text is passed as literal
+`--system-prompt` content (full replacement, not `--append-system-prompt` — that was tried too
+and got refused as a suspected injection). `build_claude_command()` and `ClaudeSessionClient`
+below already reflect this fix, not the original skill-discovery-only design.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1100,7 +1111,7 @@ cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/memory.py waypoint
 import json
 from pathlib import Path
 
-from waypoint.claude_session import SessionStore, build_claude_command, extract_session_id, ClaudeSessionClient
+from waypoint.claude_session import SessionStore, build_claude_command, extract_session_id, ClaudeSessionClient, load_persona
 
 
 def test_session_store_read_returns_none_when_file_missing(tmp_path):
@@ -1119,7 +1130,7 @@ def test_build_claude_command_without_session_id_bootstraps():
     cmd = build_claude_command(session_id=None, model="sonnet")
     assert cmd == [
         "claude", "--input-format", "stream-json", "--output-format", "stream-json",
-        "--model", "sonnet",
+        "--model", "sonnet", "--strict-mcp-config",
     ]
     assert "--resume" not in cmd
     assert "--continue" not in cmd
@@ -1130,6 +1141,35 @@ def test_build_claude_command_with_session_id_pins_via_resume():
     assert "--resume" in cmd
     assert cmd[cmd.index("--resume") + 1] == "abc123"
     assert "--continue" not in cmd
+    assert "--strict-mcp-config" in cmd
+
+
+def test_build_claude_command_includes_system_prompt_when_given():
+    cmd = build_claude_command(session_id=None, model="sonnet", system_prompt="You are Waypoint.")
+    assert "--system-prompt" in cmd
+    assert cmd[cmd.index("--system-prompt") + 1] == "You are Waypoint."
+
+
+def test_build_claude_command_omits_system_prompt_when_none():
+    cmd = build_claude_command(session_id=None, model="sonnet")
+    assert "--system-prompt" not in cmd
+
+
+def test_load_persona_strips_frontmatter(tmp_path):
+    skill_path = tmp_path / "SKILL.md"
+    skill_path.write_text(
+        "---\nname: teaching-mode\ndescription: something\n---\n\n"
+        "# Teaching-mode persona\n\nYou are Waypoint.\n"
+    )
+    persona = load_persona(skill_path)
+    assert persona == "# Teaching-mode persona\n\nYou are Waypoint."
+    assert "name: teaching-mode" not in persona
+
+
+def test_load_persona_returns_full_text_when_no_frontmatter(tmp_path):
+    skill_path = tmp_path / "SKILL.md"
+    skill_path.write_text("Just plain text, no frontmatter.")
+    assert load_persona(skill_path) == "Just plain text, no frontmatter."
 
 
 def test_extract_session_id_reads_real_fixture():
@@ -1191,6 +1231,22 @@ def test_run_turn_uses_pinned_session_id_on_subsequent_call(tmp_path):
 
     assert "--resume" in captured_cmd["cmd"]
     assert captured_cmd["cmd"][captured_cmd["cmd"].index("--resume") + 1] == "existing-session"
+
+
+def test_run_turn_passes_configured_system_prompt(tmp_path):
+    store = SessionStore(tmp_path / "current_session.json")
+
+    captured_cmd = {}
+
+    def factory(cmd, **kwargs):
+        captured_cmd["cmd"] = cmd
+        return FakeProcess([])
+
+    client = ClaudeSessionClient(store, popen_factory=factory, system_prompt="You are Waypoint.")
+    list(client.run_turn(content_blocks=[{"type": "text", "text": "hi"}], model="sonnet"))
+
+    assert "--system-prompt" in captured_cmd["cmd"]
+    assert captured_cmd["cmd"][captured_cmd["cmd"].index("--system-prompt") + 1] == "You are Waypoint."
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1229,11 +1285,38 @@ class SessionStore:
         self.path.write_text(json.dumps({"session_id": session_id}))
 
 
-def build_claude_command(session_id: Optional[str], model: str) -> list[str]:
+def load_persona(skill_path: Path) -> str:
+    """Strips the YAML frontmatter from teaching-mode's SKILL.md,
+    returning just the body. Used as literal --system-prompt content -
+    NOT relying on Claude Code's own skill-discovery mechanism, which
+    only makes a skill *available* for the model to invoke on its own
+    judgment. Verified live: a plain cwd-based skill discovery left the
+    model answering as the user's own global CLAUDE.md persona instead
+    of Waypoint's, even when explicitly asked "quem é você?" -
+    discovery is not the same as always-active context. --system-prompt
+    (full replacement, not --append-system-prompt) is what reliably
+    switches the model's identity (spec Component 7/13 finding)."""
+    text = skill_path.read_text()
+    parts = text.split("---", 2)
+    if len(parts) == 3:
+        return parts[2].strip()
+    return text.strip()
+
+
+def build_claude_command(session_id: Optional[str], model: str, system_prompt: Optional[str] = None) -> list[str]:
     """Bootstrap (session_id is None): plain new session, no --resume,
     no --continue. Pinned (session_id is set): --resume explicitly.
-    Never --continue - see spec Component 7 for why."""
-    cmd = ["claude", "--input-format", "stream-json", "--output-format", "stream-json", "--model", model]
+    Never --continue - see spec Component 7 for why. --strict-mcp-config
+    drops the user's unrelated MCP servers (Jira/Gmail/Grafana/etc.) with
+    no functional downside (spec Component 7, stream-json spike).
+    --system-prompt carries the teaching-mode persona (see load_persona) -
+    passed on every call since each turn is a separate subprocess."""
+    cmd = [
+        "claude", "--input-format", "stream-json", "--output-format", "stream-json",
+        "--model", model, "--strict-mcp-config",
+    ]
+    if system_prompt:
+        cmd += ["--system-prompt", system_prompt]
     if session_id:
         cmd += ["--resume", session_id]
     return cmd
@@ -1244,13 +1327,14 @@ def extract_session_id(event: dict) -> str:
 
 
 class ClaudeSessionClient:
-    def __init__(self, session_store: SessionStore, popen_factory=subprocess.Popen):
+    def __init__(self, session_store: SessionStore, popen_factory=subprocess.Popen, system_prompt: Optional[str] = None):
         self.session_store = session_store
         self._popen_factory = popen_factory
+        self.system_prompt = system_prompt
 
     def run_turn(self, content_blocks: list[dict], model: str) -> Iterator[dict]:
         session_id = self.session_store.read()
-        cmd = build_claude_command(session_id, model)
+        cmd = build_claude_command(session_id, model, system_prompt=self.system_prompt)
         process = self._popen_factory(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 
         request = {"type": "user", "message": {"role": "user", "content": content_blocks}}
@@ -1272,7 +1356,7 @@ class ClaudeSessionClient:
 cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_claude_session.py -v
 ```
 
-Expected: 7 passed. **If Task 2's findings showed different field names** (e.g. `session_id` nested under a different key), fix `extract_session_id()` and the corresponding test now, before moving on.
+Expected: 12 passed. **If Task 2's findings showed different field names** (e.g. `session_id` nested under a different key), fix `extract_session_id()` and the corresponding test now, before moving on.
 
 - [ ] **Step 5: Commit**
 
@@ -1573,6 +1657,19 @@ cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/tts.py && git comm
 
 No unit test — `XGrabKey` requires a live X11 display and root window access. Manual verification only.
 
+**Revised during implementation**: the original `_parse_binding()`/`start()` below used
+`root.grab_key(X.AnyKey, mask, ...)` for a modifier-only binding. Verified live against a real
+GNOME session: this fails with an asynchronous `BadAccess` X error the moment *any* other client
+(the window manager, in practice always true - GNOME/mutter typically has some Ctrl+Alt+*
+binding already) holds a grab on any single keycode under that same modifier mask.
+`python-xlib`'s `grab_key()` never raises this as a Python exception (`GrabKey` has no
+synchronous reply), so the bug is silent - the hotkey would just never fire on a real desktop,
+with no error anywhere. Fix: grab the *last* modifier's own physical keycode (e.g. `Control_L`)
+with the *other* modifiers as the mask (e.g. `Mod1Mask` for Alt) - this is what the docstring
+already described in prose, the code just didn't implement it. Also added an explicit error
+handler so a genuine grab conflict raises `HotkeyGrabError` instead of failing silently. The code
+block below reflects the fix, not the original buggy version.
+
 - [ ] **Step 1: Write the implementation**
 
 ```python
@@ -1590,17 +1687,36 @@ _MODIFIER_MASKS = {
     "super": X.Mod4Mask,
 }
 
+# Modifier name -> the keysym of its own physical key, used when the
+# whole binding is modifier-only (e.g. "ctrl+alt" has no letter key).
+_MODIFIER_OWN_KEYSYMS = {
+    "ctrl": XK.XK_Control_L,
+    "alt": XK.XK_Alt_L,
+    "shift": XK.XK_Shift_L,
+    "super": XK.XK_Super_L,
+}
 
-def _parse_binding(binding: str) -> tuple[int, int]:
-    """'ctrl+alt' -> (combined modifier mask, keycode). The keycode for
-    a pure-modifier combo (no letter key) grabs on the last modifier's
-    own keysym, matching GlobalPushToTalkShortcutMonitor.swift's
-    modifier-only shortcut behavior (spec Component 3)."""
+
+class HotkeyGrabError(RuntimeError):
+    """Raised when XGrabKey fails - most commonly because another
+    client already holds a grab on the same keycode+modifier
+    combination. See the note above start() for why this needs an
+    explicit error handler rather than a try/except."""
+
+
+def _parse_binding(display: Display, binding: str) -> tuple[int, int]:
+    """'ctrl+alt' -> (keycode of the *last* modifier's own key, combined
+    mask of every modifier *except* the last one). Grabbing X.AnyKey
+    with the full combined mask looks equivalent but isn't - see the
+    note above for why."""
     parts = binding.lower().split("+")
+    *other_parts, last_part = parts
     mask = 0
-    for part in parts:
+    for part in other_parts:
         mask |= _MODIFIER_MASKS[part]
-    return mask, 0  # keycode resolved against the live display in start()
+    keysym = _MODIFIER_OWN_KEYSYMS[last_part]
+    keycode = display.keysym_to_keycode(keysym)
+    return keycode, mask
 
 
 class HotkeyListener:
@@ -1609,6 +1725,8 @@ class HotkeyListener:
         self._display: Optional[Display] = None
         self._on_press: Optional[Callable[[], None]] = None
         self._on_release: Optional[Callable[[], None]] = None
+        self._grab_keycode: Optional[int] = None
+        self._grab_mask: Optional[int] = None
 
     def set_binding(self, binding: str) -> None:
         self.binding = binding
@@ -1618,9 +1736,22 @@ class HotkeyListener:
         self._on_release = on_release
         self._display = Display()
         root = self._display.screen().root
-        mask, _ = _parse_binding(self.binding)
-        root.grab_key(X.AnyKey, mask, True, X.GrabModeAsync, X.GrabModeAsync)
+
+        errors: list[Exception] = []
+        self._display.set_error_handler(lambda err, req=None: errors.append(err))
+
+        keycode, mask = _parse_binding(self._display, self.binding)
+        self._grab_keycode, self._grab_mask = keycode, mask
+        root.grab_key(keycode, mask, True, X.GrabModeAsync, X.GrabModeAsync)
         self._display.sync()
+
+        if errors:
+            self._display.close()
+            self._display = None
+            raise HotkeyGrabError(
+                f"Failed to grab hotkey '{self.binding}' - it's likely already bound by "
+                f"another application (e.g. the window manager). Try a different binding."
+            )
 
         pressed = False
         while True:
@@ -1635,7 +1766,8 @@ class HotkeyListener:
     def stop(self) -> None:
         if self._display:
             root = self._display.screen().root
-            root.ungrab_key(X.AnyKey, X.AnyModifier)
+            if self._grab_keycode is not None:
+                root.ungrab_key(self._grab_keycode, self._grab_mask)
             self._display.close()
             self._display = None
 ```
@@ -1651,24 +1783,50 @@ listener.start(on_press=lambda: print('PRESS'), on_release=lambda: print('RELEAS
 "
 ```
 
-Expected: pressing and releasing Ctrl+Alt on the real Pop!_OS X11 session prints `PRESS`/`RELEASE`. Ctrl+C to stop.
+Expected: pressing and releasing Ctrl+Alt on the real Pop!_OS X11 session prints `PRESS`/`RELEASE`.
+
+**Second revision - this is what actually shipped**: even with the `owner_events` fix above, live
+testing (both a real physical key press from Tony and a synthetic XTest injection) confirmed the
+`XGrabKey`-based grab never actually receives `KeyPress`/`KeyRelease` - only a spurious
+`MappingNotify`. Root cause not fully isolated (GNOME shortcut conflicts were ruled out via
+`gsettings`); `XGrabKey`-based global hotkeys are a known-fragile area across Linux desktop
+environments generally. **Switched to `pynput`** (`pip install pynput`, pulls in `evdev` as a
+transitive dependency) instead of hand-rolled `python-xlib` grabbing. `HotkeyListener` keeps the
+exact same public interface (`start(on_press, on_release)`, `stop()`, `set_binding()`) but tracks
+currently-held keys via `pynput.keyboard.Listener` and fires `on_press()`/`on_release()` once
+every required modifier in the binding is simultaneously held/released - this works because
+`pynput`'s Linux backend uses the X `RECORD` extension, a passive monitoring mechanism that
+doesn't compete with the window manager's own key grabs the way `XGrabKey` does. Verified live,
+both via XTest synthetic injection and a real physical Ctrl+Alt press/release from Tony: reliably
+fires `PRESS`/`RELEASE`. The `python-xlib`-based implementation above (Step 1's code block) was
+never actually shipped - see `waypoint/waypoint/hotkey.py` for the real, working version.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/hotkey.py && git commit -m "feat: add configurable global push-to-talk hotkey via python-xlib"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/hotkey.py waypoint/pyproject.toml && git commit -m "fix: replace XGrabKey with pynput for global hotkey capture"
 ```
 
 ---
 
-### Task 16: Teaching-mode skill file (Component 13)
+### Task 16: Teaching-mode persona file (Component 13)
 
 **Files:**
 - Create: `waypoint/.claude/skills/teaching-mode/SKILL.md`
 
 **Interfaces:**
 - Consumes: the tag syntax defined in Task 6 (`POINT`/`HIGHLIGHT`/`ANNOTATE`).
-- Produces: a file discovered automatically by the `claude` CLI subprocess (Task 10) when its `cwd` is `waypoint/`. No code interface — this is the "system prompt" for the app.
+- Produces: a file read directly by `claude_session.load_persona()` (Task 10) and passed as
+  `--system-prompt` content. **Not** discovered automatically via Claude Code's own
+  skill-invocation mechanism — see the note below.
+
+**Revised during implementation**: originally this file was meant to be auto-discovered via
+`cwd` the way any project-local skill is, with Claude Code injecting it as active context on its
+own. Verified live that this doesn't happen — a discoverable skill is only an *available tool the
+model can choose to invoke*, and in practice it didn't, even when explicitly asked "quem é você?"
+or given the skill's own literal trigger phrase. The frontmatter (`name`, `description`) is kept
+here for documentation/versioning value only; Task 10's `load_persona()` strips it and the body
+becomes the `--system-prompt` string on every turn instead.
 
 - [ ] **Step 1: Write the skill file**
 
@@ -1713,15 +1871,22 @@ your context. If the user references a past conversation ("volta naquele papo so
 use this index to recognize what they mean - the app handles the actual session switch.
 ```
 
-- [ ] **Step 2: Verify discovery**
+- [ ] **Step 2: Verify the persona activates via --system-prompt**
 
 ```bash
 cd /home/tony/projects/clicky-cc/waypoint
-echo '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"quem é você?"}]}}' | \
-  claude --input-format stream-json --output-format stream-json --model sonnet
+python3 -c "
+import json
+content = open('.claude/skills/teaching-mode/SKILL.md').read().split('---', 2)[2]
+req = {'type':'user','message':{'role':'user','content':[{'type':'text','text':'quem é você?'}]}}
+print(json.dumps(req))
+" | claude --input-format stream-json --output-format stream-json --model sonnet --strict-mcp-config \
+  --system-prompt "$(python3 -c "print(open('.claude/skills/teaching-mode/SKILL.md').read().split('---', 2)[2])")"
 ```
 
-Expected: the response reflects the teaching-mode persona (mentions pointing/screen/teaching), confirming the CLI picked up the skill from `cwd`.
+Expected: the response reflects the teaching-mode persona (mentions pointing/screen/teaching, in
+character as Waypoint) — confirming `--system-prompt` delivery works, not that `cwd` discovery
+picked anything up (it doesn't, see above).
 
 - [ ] **Step 3: Commit**
 
@@ -1735,68 +1900,154 @@ cd /home/tony/projects/clicky-cc && git add waypoint/.claude/skills/teaching-mod
 
 **Files:**
 - Create: `waypoint/waypoint/tray.py`
+- Create: `waypoint/waypoint/tray_process.py`
 
 **Interfaces:**
-- Produces: `TrayIcon` with `__init__(on_click: Callable[[], None])`, `run() -> None`. Used by Task 20 (app wiring).
+- Produces: `TrayIcon` with `__init__(on_click: Callable[[], None])`, `run() -> None` (non-blocking - spawns the subprocess and a listener thread, then returns), `stop() -> None`. Used by Task 20 (app wiring).
 
-No unit test — `AppIndicator3` requires a live GNOME session. Manual verification only.
+No unit test for the GTK3/AppIndicator3 parts — requires a live GNOME session, manual verification only. The socket IPC path itself was verified with an automated end-to-end check (send a raw `b"click"` message and confirm `on_click` fires), not a real mouse click.
 
-- [ ] **Step 1: Write the implementation**
+**Revised during implementation**: the original plan assumed `AyatanaAppIndicator3` loaded alongside `Gtk 4.0` in one process. Verified live that both assumptions are wrong on this system: (1) the installed typelib namespace is `AppIndicator3`, not `AyatanaAppIndicator3` — Ubuntu's `gir1.2-appindicator3-0.1` package keeps the legacy GI namespace name even though the runtime library is `libayatana-appindicator3`; (2) more importantly, `AppIndicator3`'s typelib unconditionally pulls in **GTK 3**, which cannot coexist with GTK 4 in the same process (`gi.RepositoryError: Requiring namespace 'Gtk' version '4.0', but '3.0' is already loaded`) — confirmed no GTK4-native alternative exists on this system, including the Ayatana fork (`gir1.2-ayatanaappindicator3-0.1` is packaged "GTK-3+ version" too). Fix: the tray icon runs in its own subprocess (`tray_process.py`, GTK3 + AppIndicator3 exclusively), talking to the main GTK4 process over a local Unix domain socket at `WAYPOINT_HOME / "tray.sock"`. Also found: the pip-installed `PyGObject` wheel doesn't search `/usr/lib/girepository-1.0` by default (only the multiarch path) — Ubuntu's typelib installs there specifically, so both files set `GI_TYPELIB_PATH` before any `gi.require_version()` call.
+
+- [ ] **Step 1: Write the main-process side**
 
 ```python
 # waypoint/waypoint/tray.py
-import gi
+"""Component 1: tray icon, running in a separate GTK3 process (see
+module docstring rationale above)."""
+import socket
+import subprocess
+import sys
+import threading
+from typing import Callable, Optional
 
-gi.require_version("Gtk", "4.0")
-gi.require_version("AyatanaAppIndicator3", "0.1")
-from gi.repository import AyatanaAppIndicator3 as AppIndicator3, Gtk  # noqa: E402
+from waypoint.config import WAYPOINT_HOME
 
-from typing import Callable
+TRAY_SOCKET_PATH = WAYPOINT_HOME / "tray.sock"
 
 
 class TrayIcon:
-    """Component 1: AppIndicator3 tray icon. Requires the GNOME
-    AppIndicator/KStatusNotifierItem extension to be active - detect
-    and prompt at startup (see Task 20) rather than fail silently."""
+    """Spawns the GTK3/AppIndicator3 tray subprocess and invokes
+    on_click() in THIS process whenever it's clicked, via a local Unix
+    socket. run() is non-blocking - it starts the subprocess and a
+    background listener thread, then returns, so the caller's own GTK4
+    main loop (panel/overlay) can run in this process afterward."""
 
     def __init__(self, on_click: Callable[[], None]):
         self._on_click = on_click
-        self._indicator = AppIndicator3.Indicator.new(
-            "waypoint",
-            "utilities-terminal",  # placeholder icon name; swap for a real asset
-            AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
-        )
-        self._indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
-
-        menu = Gtk.Menu() if hasattr(Gtk, "Menu") else None
-        # AppIndicator3 predates GTK4's menu model; a minimal GTK3-style
-        # menu is still required here for the click target. Wire
-        # on_click through a single "Open Companion" menu item.
-        self._indicator.set_menu(menu)
+        self._process: Optional[subprocess.Popen] = None
+        self._server: Optional[socket.socket] = None
 
     def run(self) -> None:
-        Gtk.main()
+        TRAY_SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if TRAY_SOCKET_PATH.exists():
+            TRAY_SOCKET_PATH.unlink()
+
+        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server.bind(str(TRAY_SOCKET_PATH))
+        self._server.listen(1)
+
+        threading.Thread(target=self._listen, daemon=True).start()
+
+        self._process = subprocess.Popen(
+            [sys.executable, "-m", "waypoint.tray_process", str(TRAY_SOCKET_PATH)]
+        )
+
+    def _listen(self) -> None:
+        while True:
+            conn, _ = self._server.accept()
+            with conn:
+                data = conn.recv(1024)
+                if data == b"click":
+                    self._on_click()
+
+    def stop(self) -> None:
+        if self._process:
+            self._process.terminate()
+        if self._server:
+            self._server.close()
 ```
 
-**Note for the implementer**: `AppIndicator3` is a GTK3-era API without a clean GTK4 menu equivalent; the exact menu wiring above is a starting point, not gospel — confirm against whatever `AyatanaAppIndicator3` typelib version is actually installed on Pop!_OS 24.04 before trusting the menu construction line, and adjust if the API differs.
+- [ ] **Step 2: Write the GTK3 subprocess**
 
-- [ ] **Step 2: Manual verification**
+```python
+# waypoint/waypoint/tray_process.py
+import os
+import socket
+import sys
+
+os.environ.setdefault("GI_TYPELIB_PATH", "/usr/lib/girepository-1.0")
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AppIndicator3", "0.1")
+from gi.repository import AppIndicator3, Gtk  # noqa: E402
+
+
+def _send_click(socket_path: str) -> None:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(socket_path)
+            sock.sendall(b"click")
+    except OSError:
+        pass  # main process isn't listening (yet) - drop the click rather than crash the tray
+
+
+def main() -> None:
+    socket_path = sys.argv[1]
+
+    indicator = AppIndicator3.Indicator.new(
+        "waypoint",
+        "utilities-terminal",  # placeholder icon name; swap for a real asset
+        AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+    )
+    indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+
+    menu = Gtk.Menu()
+    open_item = Gtk.MenuItem(label="Open Companion")
+    open_item.connect("activate", lambda _widget: _send_click(socket_path))
+    menu.append(open_item)
+    menu.show_all()
+    indicator.set_menu(menu)
+
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 3: Automated IPC verification**
 
 ```bash
 cd /home/tony/projects/clicky-cc/waypoint
 python3 -c "
-from waypoint.tray import TrayIcon
-icon = TrayIcon(on_click=lambda: print('clicked'))
+import socket, time
+from waypoint.tray import TrayIcon, TRAY_SOCKET_PATH
+
+clicked = []
+icon = TrayIcon(on_click=lambda: clicked.append(True))
 icon.run()
+time.sleep(2)
+assert icon._process.poll() is None, 'subprocess died'
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+    sock.connect(str(TRAY_SOCKET_PATH))
+    sock.sendall(b'click')
+time.sleep(0.5)
+assert len(clicked) == 1, 'on_click did not fire'
+icon.stop()
+print('IPC path verified')
 "
 ```
 
-Expected: an icon appears in the GNOME top bar (requires `gnome-shell-extension-appindicator` active — this is spec Component 1's documented fallback prompt if it isn't).
+Expected: `IPC path verified`, no assertion errors. This confirms the subprocess starts without crashing and the socket delivers clicks — it does **not** confirm the icon is visually correct on the real desktop; do that separately by watching the GNOME top bar while running the same snippet without the synthetic socket send (requires `gnome-shell-extension-appindicator` active — spec Component 1's documented fallback prompt if it isn't).
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/tray.py && git commit -m "feat: add AppIndicator3 tray icon"
+cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/tray.py waypoint/waypoint/tray_process.py && git commit -m "feat: add tray icon as a separate GTK3 subprocess (Component 1)"
 ```
 
 ---
@@ -2047,7 +2298,7 @@ from waypoint.audio_capture import MicRecorder
 from waypoint.stt import Transcriber
 from waypoint.screen_capture import capture_all_screens
 from waypoint.model_routing import resolve_model
-from waypoint.claude_session import ClaudeSessionClient, SessionStore
+from waypoint.claude_session import ClaudeSessionClient, SessionStore, load_persona
 from waypoint.context_manager import ContextManager
 from waypoint.ollama_fallback import pick_vision_model
 from waypoint.tags import parse_tags, strip_tags
@@ -2068,11 +2319,23 @@ class WaypointApp:
         self.mic = MicRecorder()
         self.transcriber = Transcriber()
         self.session_store = SessionStore(CURRENT_SESSION_FILE)
-        self.claude_client = ClaudeSessionClient(self.session_store)
+        self.claude_client = ClaudeSessionClient(self.session_store, system_prompt=self._build_system_prompt())
         self.context_manager = ContextManager()
         self.tts = PiperTTS(model_path="~/.waypoint/models/pt_BR-faber-medium.onnx")
         self.overlays: list[AnnotationOverlay] = []
         self._last_activity = time.monotonic()
+
+    def _build_system_prompt(self) -> str:
+        # Component 7/13: skill auto-discovery via cwd doesn't reliably
+        # inject content (verified live, Task 16) - the persona is read
+        # directly and passed as --system-prompt instead. MEMORY.md is
+        # appended after it so cross-session continuity (Component 12)
+        # rides the same mechanism rather than relying on cwd residency.
+        skill_path = Path(__file__).parent.parent / ".claude" / "skills" / "teaching-mode" / "SKILL.md"
+        persona = load_persona(skill_path)
+        if MEMORY_INDEX_FILE.exists():
+            persona += "\n\n## MEMORY.md\n\n" + MEMORY_INDEX_FILE.read_text()
+        return persona
 
     def on_hotkey_press(self) -> None:
         self.controller.on_hotkey_press()

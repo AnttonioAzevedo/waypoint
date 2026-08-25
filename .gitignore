@@ -5,5 +5,7 @@ worker/.dev.vars
 build/
 releases/
 .claude/
+!waypoint/.claude/
+!waypoint/.claude/**
 coding-plans/
 .worktrees/

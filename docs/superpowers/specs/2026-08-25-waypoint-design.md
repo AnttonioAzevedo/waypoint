@@ -41,7 +41,9 @@ reusing (see Components 10 and 11), not as a dependency or fork target.
 
 ## Architecture
 
-Single Python process, GTK4 + libadwaita for UI. No client-server split, no Cloudflare Worker,
+Single main Python process (GTK4 + libadwaita for UI) plus one small dedicated subprocess for the
+tray icon (GTK3 + AppIndicator3 — see Component 1 for why they can't share a process), talking
+over a local Unix socket. No client-server split, no Cloudflare Worker,
 no API keys — every external call in the current app is replaced by either a local model or a
 local CLI subprocess.
 
@@ -52,8 +54,8 @@ local CLI subprocess.
 │  ┌────────────┐  ┌──────────────┐  ┌────────────────────┐          │
 │  │ Tray icon  │  │ Hotkey        │  │ Companion panel     │          │
 │  │ (AppIndi-  │  │ listener      │  │ (Gtk.Window,         │          │
-│  │  cator3)   │  │ (python-xlib, │  │  libadwaita styled)  │          │
-│  │            │  │  configurable)│  │                       │          │
+│  │  cator3,   │  │ (pynput,      │  │  libadwaita styled)  │          │
+│  │  subproc)  │  │  configurable)│  │                       │          │
 │  └─────┬──────┘  └──────┬───────┘  └──────────┬──────────┘          │
 │        │                │                     │                     │
 │        └───────────┬────┴─────────────────────┘                     │
@@ -86,11 +88,20 @@ CLI spawn always uses --resume <pinned session_id> (Component 7), never --contin
 
 ## Components
 
-### 1. Tray icon — `AppIndicator3` (via `PyGObject`)
+### 1. Tray icon — `AppIndicator3` (via `PyGObject`), separate GTK3 subprocess
 Standard libappindicator, GNOME on Pop!_OS 24.04 ships the AppIndicator/KStatusNotifierItem
 extension by default. Click opens the companion panel positioned near the tray. Fallback: if
 the extension isn't active, detect at startup and prompt the user to enable
 `gnome-shell-extension-appindicator` (one-time setup note, not code we ship).
+
+**Runs in its own subprocess, not the main process**: verified live that `AppIndicator3`'s
+typelib forces GTK3 to load, which fatally conflicts with the main process's GTK4 requirement
+(`gi.RepositoryError: Requiring namespace 'Gtk' version '4.0', but '3.0' is already loaded`) — no
+GTK4-native tray library is available on this system, including the Ayatana fork (its typelib is
+packaged GTK-3-only). The tray icon and its menu run in a small dedicated subprocess
+(`tray_process.py`, GTK3 + AppIndicator3 only); a click sends a one-word message to the main
+process over a local Unix domain socket. Invisible to the user — same click-to-open behavior —
+but the main (GTK4) and tray (GTK3) processes are architecturally separate.
 
 ### 2. Companion panel — `Gtk.Window` + libadwaita
 Borderless, `set_decorated(False)`, `set_keep_above(True)`. Styled with a custom
@@ -99,13 +110,24 @@ custom shadow via `Gtk.Overlay` trick since X11 doesn't composite window shadows
 WM) to approximate the original `DesignSystem.swift` dark aesthetic. Click-outside-to-dismiss
 via a global X11 button-press grab while the panel is open.
 
-### 3. Hotkey — `python-xlib`, user-configurable
-Global key-grab via `XGrabKey` on the root window. Default binding is `ctrl+alt` (Linux
-equivalent of the original `ctrl+option`), but the combination is captured and re-registered
-live from the panel settings UI — same idea as Flicky's customizable shortcut capture, applied
-here to close the "confirm keybinding with user" open item from the previous draft: instead of
-hardcoding it, the user picks it once in the UI. Press/release tracked the same way
-`GlobalPushToTalkShortcutMonitor.swift` does — a state transition, not a toggle.
+### 3. Hotkey — `pynput`, user-configurable
+Default binding is `ctrl+alt` (Linux equivalent of the original `ctrl+option`), but the
+combination is captured and re-registered live from the panel settings UI — same idea as
+Flicky's customizable shortcut capture, applied here to close the "confirm keybinding with user"
+open item from the previous draft: instead of hardcoding it, the user picks it once in the UI.
+Press/release tracked the same way `GlobalPushToTalkShortcutMonitor.swift` does — a state
+transition (all required modifiers held → fire; any released → fire release), not a toggle.
+
+**Not raw `XGrabKey` via `python-xlib`, despite that being the original plan**: verified live on
+a real Pop!_OS 24.04/GNOME session that `XGrabKey`-based grabbing doesn't reliably work here —
+neither a real physical key press nor a synthetic XTest-injected one ever reached the grab (only
+a spurious `MappingNotify`), even after fixing a real `owner_events` bug and ruling out a GNOME
+shortcut conflict via `gsettings`. Root cause not fully isolated; `XGrabKey` global hotkeys are a
+known-fragile area across Linux desktop environments in general. Switched to `pynput`, whose
+Linux backend uses the X `RECORD` extension — a passive monitoring mechanism, not an exclusive
+grab, so it doesn't compete with the window manager's own shortcut bindings the way `XGrabKey`
+does. Verified live, both via synthetic XTest injection and a real physical key press: reliably
+fires press/release.
 
 ### 4. Screen capture — `mss`
 `mss` grabs X11 frame buffers directly, no portal negotiation needed on X11 (unlike Wayland).
@@ -124,11 +146,26 @@ functional contract (`OpenAIAudioTranscriptionProvider.swift` is the closest exi
 precedent: buffer-then-upload, except now buffer-then-local-transcribe).
 
 ### 7. Chat — `claude` CLI subprocess (Claude Code, user's Pro/Max subscription)
-Spawned via `subprocess.Popen` with `--input-format stream-json --output-format stream-json`.
+Spawned via `subprocess.Popen` with `--input-format stream-json --output-format stream-json
+--strict-mcp-config` (no `--mcp-config` passed, so zero MCP servers load — Waypoint never uses
+the user's Jira/Gmail/Grafana/etc. tool set, and dropping it costs nothing).
 Content blocks (image + text) built in the same shape the original `ClaudeAPI.swift` already
 constructs (`{"type": "image", "source": {"type": "base64", "media_type": ..., "data": ...}}` +
 text block), fed over stdin as NDJSON. Output NDJSON parsed for token deltas, re-emitted as
 progressive text chunks to the UI — replicating the `onTextChunk` streaming callback contract.
+
+**Accepted trade-off — full user environment inherited on purpose**: a `claude` subprocess in
+this `cwd` inherits the user's global hooks, installed plugins (including whatever skills those
+plugins expose), and `CLAUDE.md` persona — confirmed via a live validation call (spike, see
+`waypoint/docs/stream-json-findings.md`). This is deliberate, not an oversight: the user wants
+Waypoint to be "smart" via the same skills he already has installed, not run in an isolated
+bubble. The one real cost is a one-time tax at session bootstrap (~$0.15 on the first turn of a
+pinned session, from hook/skill content entering the prompt cache for the first time) —
+**not a per-turn cost**: every subsequent turn in that same `--resume`-pinned session reads the
+same content from cache at a fraction of the price (~$0.03), so the tax is paid once per session,
+not once per voice interaction. `--safe-mode` and `--bare` were both evaluated and rejected:
+`--safe-mode` kills skill discovery entirely (breaks Component 13), `--bare` additionally requires
+`ANTHROPIC_API_KEY` and can't use the subscription OAuth session at all.
 
 **Session pinning, not `--continue`**: `--continue` resumes "the most recent session for this
 cwd" — a heuristic that breaks the moment the user also runs `claude` interactively in the same
@@ -226,9 +263,11 @@ restart) and not something we're inheriting on purpose.
   ```
   Kept short on purpose — this is what gets loaded every session start, not the full memory
   files.
-- On next app start, `MEMORY.md`'s content is prepended to the `claude` CLI's system prompt (or
-  read via the teaching-mode skill, Component 13) so the model has continuity across restarts
-  without resending full transcripts or images from prior days.
+- On next app start, `MEMORY.md`'s content is concatenated into the same `--system-prompt` string
+  built by `claude_session.load_persona()` (Component 13) — appended after the teaching-mode
+  persona body — so the model has continuity across restarts without resending full transcripts
+  or images from prior days. Not passive `cwd` residency (see Component 13's finding on why that
+  doesn't reliably work) — the app reads the file and builds the string explicitly.
 
 **Session recall ("volta naquele papo sobre X")**: since the model sees the `MEMORY.md` index
 every session, it can recognize when the user is asking to return to a past topic. This is
@@ -239,19 +278,28 @@ pinned `session_id` (Component 7) to that entry's ID. The old session's full his
 in the CLI's own session store — nothing was deleted, only which ID is currently pinned
 changes. Switching back later is the same mechanism in reverse.
 
-### 13. Teaching-mode skill — `.claude/skills/teaching-mode/SKILL.md`
-Since the app's `claude` CLI subprocess always runs with its `cwd` set to the app's working
-directory, Claude Code's own skill-discovery mechanism picks up a project-level
-`.claude/skills/teaching-mode/SKILL.md` automatically — no custom loading code needed. This
-file documents, in the format Claude Code already understands:
+### 13. Teaching-mode persona — `.claude/skills/teaching-mode/SKILL.md`, loaded via `--system-prompt`
+The persona/tag-syntax content lives in `.claude/skills/teaching-mode/SKILL.md` — still a
+versioned, human-editable file, the natural place to tune "teacher personality" without touching
+application code. **Delivery mechanism revised from the original design**: the file's body (minus
+YAML frontmatter) is read by `claude_session.load_persona()` and passed as literal
+`--system-prompt` content on every `run_turn()` call — **not** relying on Claude Code's own
+cwd-based skill-discovery to inject it automatically.
 
-- Tone/persona for the "teaches like a real teacher beside you" behavior.
-- The exact tag syntax and when to use `POINT` vs `HIGHLIGHT` vs `ANNOTATE` (e.g. point at a
-  single control, highlight a region being discussed, annotate to draw attention mid-explanation).
-- Pointer to `MEMORY.md` for continuity context.
+**Why the original plan (passive skill-discovery) doesn't work**: discovering a project-local
+skill via `cwd` only makes it an *available tool the model can choose to invoke* — it does not
+inject the skill's content into the system prompt automatically. Confirmed live: with the skill
+file present and discoverable, asking "quem é você?" got an answer in the user's own global
+`CLAUDE.md` persona, not Waypoint's — the model never invoked the skill on its own. A live probe
+with an explicit trigger phrase had the same result. `--append-system-prompt` was tried as an
+alternative and also failed — the model treated appended content as an untrusted injection attempt
+and explicitly refused to adopt it. `--system-prompt` (full replacement of Claude Code's own
+default system prompt, not an append) is what reliably works, confirmed live: the model adopted
+the Waypoint persona, spoke in-character, and used a `POINT` tag unprompted.
 
-This replaces a large hardcoded system-prompt string in Python with a versioned, human-editable
-file — the natural place to tune "teacher personality" without touching application code.
+The `SKILL.md` frontmatter (`name`, `description`) is kept for documentation/versioning
+consistency even though it's no longer functionally read by Claude Code's skill mechanism — only
+the body is used, via direct file read, not skill invocation.
 
 ### 14. Request queue — handling a hotkey press mid-turn
 The state machine (`idle → listening → processing → responding → idle`) is a single-turn cycle;
@@ -302,8 +350,8 @@ Given the ask to keep it visually nice, not just functional:
    turn uses.
 5. `ContextManager` checks token budget; compacts if over `COMPACT_TRIGGER` (Component 10, which
    also handles session-recall requests by swapping the pinned `session_id`).
-6. `claude` CLI spawned with `--resume <pinned session_id>` (Component 7), image(s) + transcript
-   + system prompt (teaching-mode skill + `MEMORY.md` context already resident via cwd) → state
+6. `claude` CLI spawned with `--resume <pinned session_id>` and `--system-prompt` carrying the
+   teaching-mode persona + `MEMORY.md` context (Component 7/13), image(s) + transcript → state
    → `processing`. On subprocess failure, Ollama fallback (Component 11) is attempted before
    surfacing an error.
 7. Streamed text deltas → panel/overlay bubble updates progressively → state → `responding`.
@@ -343,8 +391,9 @@ Given the ask to keep it visually nice, not just functional:
 
 ## Open items carried into the implementation plan
 
-- Exact `stream-json` schema validation, including the `init` event's `session_id` field and
-  `--resume` behavior with image-bearing turns (blocking task #1).
+- ~~Exact `stream-json` schema validation, including the `init` event's `session_id` field and
+  `--resume` behavior with image-bearing turns~~ — **resolved**, see Component 7 and
+  `waypoint/docs/stream-json-findings.md`.
 - Confirm AppIndicator GNOME extension is active on this machine before building tray code.
   Pop!_OS 24.04 ships COSMIC (Rust, not GNOME-based) as its **default** session — GNOME is an
   optional session you select at the login screen. Re-confirm `$XDG_SESSION_TYPE` and
