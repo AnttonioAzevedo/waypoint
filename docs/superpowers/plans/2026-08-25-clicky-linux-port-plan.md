@@ -898,7 +898,7 @@ VISION_FAMILIES: list[str] = [
     "llava-llama3", "llava-phi3", "granite3.2-vision",
     "qwen2-vl", "qwen2.5-vl", "qwen3-vl",
     "llava-v1.6", "llava-v1.5", "gemma3", "gemma4",
-    "mistral-small3.1", "devstral",
+    "mistral-small3.1",
 ]
 
 

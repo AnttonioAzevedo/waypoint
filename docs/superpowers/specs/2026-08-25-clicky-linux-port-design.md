@@ -339,6 +339,11 @@ Given the ask to keep it visually nice, not just functional:
 - Exact `stream-json` schema validation, including the `init` event's `session_id` field and
   `--resume` behavior with image-bearing turns (blocking task #1).
 - Confirm AppIndicator GNOME extension is active on this machine before building tray code.
+  Pop!_OS 24.04 ships COSMIC (Rust, not GNOME-based) as its **default** session — GNOME is an
+  optional session you select at the login screen. Re-confirm `$XDG_SESSION_TYPE` and
+  `echo $XDG_CURRENT_DESKTOP` right before starting Task 17 (tray), since AppIndicator3,
+  `set_keep_above`, `override_redirect`, and the X11 click-outside grab (Component 2/9) all
+  assume a GNOME/mutter session specifically, not COSMIC's own compositor.
 - Whisper/Piper model size vs. quality trade-off — pick default, document override.
 - Confirm at least one vision-capable Ollama model is realistically runnable on this machine
   before treating Component 11 as anything but a documented no-op fallback.
