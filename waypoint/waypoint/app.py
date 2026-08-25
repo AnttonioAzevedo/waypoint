@@ -82,7 +82,7 @@ class WaypointApp:
         # Called from the hotkey listener thread (see class docstring).
         self.controller.on_hotkey_press()
         if self.controller.state.name == "LISTENING":
-            self.mic.start()
+            self.mic.start(level_callback=lambda level: GLib.idle_add(self.panel.push_level, level))
             GLib.idle_add(self.panel.set_status_text, "Ouvindo...")
 
     def on_hotkey_release(self) -> None:
@@ -91,6 +91,7 @@ class WaypointApp:
         # the next hotkey event immediately (Component 14's queue only
         # helps if presses are still being detected while busy).
         audio_buffer = self.mic.stop()
+        GLib.idle_add(self.panel.reset_waveform)
         self.controller.on_hotkey_release(audio_buffer)
         if self.controller.state.name == "PROCESSING":
             threading.Thread(target=self._run_turn, args=(audio_buffer,), daemon=True).start()

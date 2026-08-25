@@ -22,12 +22,23 @@ class AnnotationOverlay(Gtk.Window):
 
         self._drawing_area = Gtk.DrawingArea()
         self._drawing_area.set_draw_func(self._on_draw)
-        self.set_child(self._drawing_area)
+
+        # Task 21 (UI polish): crossfade the whole overlay in when the
+        # first tag of a response appears, and out once the last one
+        # is gone - annotation marks read as part of the same visual
+        # system as the panel, not a bolted-on layer (spec UI polish).
+        self._revealer = Gtk.Revealer()
+        self._revealer.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
+        self._revealer.set_transition_duration(300)
+        self._revealer.set_child(self._drawing_area)
+        self._revealer.set_reveal_child(False)
+        self.set_child(self._revealer)
 
         self._active_tags: list[Tag] = []
 
     def draw_tag(self, tag: Tag) -> None:
         self._active_tags.append(tag)
+        self._revealer.set_reveal_child(True)
         self._drawing_area.queue_draw()
 
         if isinstance(tag, (HighlightTag, AnnotateTag)):
@@ -35,12 +46,15 @@ class AnnotationOverlay(Gtk.Window):
 
     def clear(self) -> None:
         self._active_tags = []
+        self._revealer.set_reveal_child(False)
         self._drawing_area.queue_draw()
 
     def _fade_out(self, tag: Tag) -> bool:
         if tag in self._active_tags:
             self._active_tags.remove(tag)
             self._drawing_area.queue_draw()
+            if not self._active_tags:
+                self._revealer.set_reveal_child(False)
         return GLib.SOURCE_REMOVE
 
     def _on_draw(self, area, cr, width, height) -> None:
