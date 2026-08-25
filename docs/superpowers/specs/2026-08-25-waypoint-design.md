@@ -241,9 +241,11 @@ restart) and not something we're inheriting on purpose.
   ```
   Kept short on purpose — this is what gets loaded every session start, not the full memory
   files.
-- On next app start, `MEMORY.md`'s content is prepended to the `claude` CLI's system prompt (or
-  read via the teaching-mode skill, Component 13) so the model has continuity across restarts
-  without resending full transcripts or images from prior days.
+- On next app start, `MEMORY.md`'s content is concatenated into the same `--system-prompt` string
+  built by `claude_session.load_persona()` (Component 13) — appended after the teaching-mode
+  persona body — so the model has continuity across restarts without resending full transcripts
+  or images from prior days. Not passive `cwd` residency (see Component 13's finding on why that
+  doesn't reliably work) — the app reads the file and builds the string explicitly.
 
 **Session recall ("volta naquele papo sobre X")**: since the model sees the `MEMORY.md` index
 every session, it can recognize when the user is asking to return to a past topic. This is
@@ -254,19 +256,28 @@ pinned `session_id` (Component 7) to that entry's ID. The old session's full his
 in the CLI's own session store — nothing was deleted, only which ID is currently pinned
 changes. Switching back later is the same mechanism in reverse.
 
-### 13. Teaching-mode skill — `.claude/skills/teaching-mode/SKILL.md`
-Since the app's `claude` CLI subprocess always runs with its `cwd` set to the app's working
-directory, Claude Code's own skill-discovery mechanism picks up a project-level
-`.claude/skills/teaching-mode/SKILL.md` automatically — no custom loading code needed. This
-file documents, in the format Claude Code already understands:
+### 13. Teaching-mode persona — `.claude/skills/teaching-mode/SKILL.md`, loaded via `--system-prompt`
+The persona/tag-syntax content lives in `.claude/skills/teaching-mode/SKILL.md` — still a
+versioned, human-editable file, the natural place to tune "teacher personality" without touching
+application code. **Delivery mechanism revised from the original design**: the file's body (minus
+YAML frontmatter) is read by `claude_session.load_persona()` and passed as literal
+`--system-prompt` content on every `run_turn()` call — **not** relying on Claude Code's own
+cwd-based skill-discovery to inject it automatically.
 
-- Tone/persona for the "teaches like a real teacher beside you" behavior.
-- The exact tag syntax and when to use `POINT` vs `HIGHLIGHT` vs `ANNOTATE` (e.g. point at a
-  single control, highlight a region being discussed, annotate to draw attention mid-explanation).
-- Pointer to `MEMORY.md` for continuity context.
+**Why the original plan (passive skill-discovery) doesn't work**: discovering a project-local
+skill via `cwd` only makes it an *available tool the model can choose to invoke* — it does not
+inject the skill's content into the system prompt automatically. Confirmed live: with the skill
+file present and discoverable, asking "quem é você?" got an answer in the user's own global
+`CLAUDE.md` persona, not Waypoint's — the model never invoked the skill on its own. A live probe
+with an explicit trigger phrase had the same result. `--append-system-prompt` was tried as an
+alternative and also failed — the model treated appended content as an untrusted injection attempt
+and explicitly refused to adopt it. `--system-prompt` (full replacement of Claude Code's own
+default system prompt, not an append) is what reliably works, confirmed live: the model adopted
+the Waypoint persona, spoke in-character, and used a `POINT` tag unprompted.
 
-This replaces a large hardcoded system-prompt string in Python with a versioned, human-editable
-file — the natural place to tune "teacher personality" without touching application code.
+The `SKILL.md` frontmatter (`name`, `description`) is kept for documentation/versioning
+consistency even though it's no longer functionally read by Claude Code's skill mechanism — only
+the body is used, via direct file read, not skill invocation.
 
 ### 14. Request queue — handling a hotkey press mid-turn
 The state machine (`idle → listening → processing → responding → idle`) is a single-turn cycle;
@@ -317,8 +328,8 @@ Given the ask to keep it visually nice, not just functional:
    turn uses.
 5. `ContextManager` checks token budget; compacts if over `COMPACT_TRIGGER` (Component 10, which
    also handles session-recall requests by swapping the pinned `session_id`).
-6. `claude` CLI spawned with `--resume <pinned session_id>` (Component 7), image(s) + transcript
-   + system prompt (teaching-mode skill + `MEMORY.md` context already resident via cwd) → state
+6. `claude` CLI spawned with `--resume <pinned session_id>` and `--system-prompt` carrying the
+   teaching-mode persona + `MEMORY.md` context (Component 7/13), image(s) + transcript → state
    → `processing`. On subprocess failure, Ollama fallback (Component 11) is attempted before
    surfacing an error.
 7. Streamed text deltas → panel/overlay bubble updates progressively → state → `responding`.

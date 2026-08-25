@@ -1090,8 +1090,17 @@ cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/memory.py waypoint
 - Test: `waypoint/tests/test_claude_session.py`
 
 **Interfaces:**
-- Consumes: `config.CURRENT_SESSION_FILE` (Task 3), the `init` event fixture from Task 2 (`tests/fixtures/stream_json_init_event.json`).
-- Produces: `SessionStore` (`read() -> str | None`, `write(session_id: str) -> None`), `build_claude_command(session_id, model) -> list[str]`, `extract_session_id(event: dict) -> str`, `ClaudeSessionClient.run_turn(content_blocks, model) -> Iterator[dict]`. Used by Task 20's app loop.
+- Consumes: `config.CURRENT_SESSION_FILE` (Task 3), the `init` event fixture from Task 2 (`tests/fixtures/stream_json_init_event.json`), the teaching-mode `SKILL.md` body from Task 16.
+- Produces: `SessionStore` (`read() -> str | None`, `write(session_id: str) -> None`), `load_persona(skill_path: Path) -> str` (strips YAML frontmatter), `build_claude_command(session_id, model, system_prompt=None) -> list[str]`, `extract_session_id(event: dict) -> str`, `ClaudeSessionClient(session_store, popen_factory=..., system_prompt=None).run_turn(content_blocks, model) -> Iterator[dict]`. Used by Task 20's app loop.
+
+**Revised during implementation**: the original design assumed Claude Code's cwd-based skill
+discovery would auto-inject the teaching-mode persona (Component 13). Live verification showed
+this is false — discovery only makes a skill *available to invoke*, it doesn't inject content
+automatically; the model answered as the user's own global `CLAUDE.md` persona instead. Fix:
+`load_persona()` reads the skill file directly and the persona text is passed as literal
+`--system-prompt` content (full replacement, not `--append-system-prompt` — that was tried too
+and got refused as a suspected injection). `build_claude_command()` and `ClaudeSessionClient`
+below already reflect this fix, not the original skill-discovery-only design.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1100,7 +1109,7 @@ cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/memory.py waypoint
 import json
 from pathlib import Path
 
-from waypoint.claude_session import SessionStore, build_claude_command, extract_session_id, ClaudeSessionClient
+from waypoint.claude_session import SessionStore, build_claude_command, extract_session_id, ClaudeSessionClient, load_persona
 
 
 def test_session_store_read_returns_none_when_file_missing(tmp_path):
@@ -1131,6 +1140,34 @@ def test_build_claude_command_with_session_id_pins_via_resume():
     assert cmd[cmd.index("--resume") + 1] == "abc123"
     assert "--continue" not in cmd
     assert "--strict-mcp-config" in cmd
+
+
+def test_build_claude_command_includes_system_prompt_when_given():
+    cmd = build_claude_command(session_id=None, model="sonnet", system_prompt="You are Waypoint.")
+    assert "--system-prompt" in cmd
+    assert cmd[cmd.index("--system-prompt") + 1] == "You are Waypoint."
+
+
+def test_build_claude_command_omits_system_prompt_when_none():
+    cmd = build_claude_command(session_id=None, model="sonnet")
+    assert "--system-prompt" not in cmd
+
+
+def test_load_persona_strips_frontmatter(tmp_path):
+    skill_path = tmp_path / "SKILL.md"
+    skill_path.write_text(
+        "---\nname: teaching-mode\ndescription: something\n---\n\n"
+        "# Teaching-mode persona\n\nYou are Waypoint.\n"
+    )
+    persona = load_persona(skill_path)
+    assert persona == "# Teaching-mode persona\n\nYou are Waypoint."
+    assert "name: teaching-mode" not in persona
+
+
+def test_load_persona_returns_full_text_when_no_frontmatter(tmp_path):
+    skill_path = tmp_path / "SKILL.md"
+    skill_path.write_text("Just plain text, no frontmatter.")
+    assert load_persona(skill_path) == "Just plain text, no frontmatter."
 
 
 def test_extract_session_id_reads_real_fixture():
@@ -1192,6 +1229,22 @@ def test_run_turn_uses_pinned_session_id_on_subsequent_call(tmp_path):
 
     assert "--resume" in captured_cmd["cmd"]
     assert captured_cmd["cmd"][captured_cmd["cmd"].index("--resume") + 1] == "existing-session"
+
+
+def test_run_turn_passes_configured_system_prompt(tmp_path):
+    store = SessionStore(tmp_path / "current_session.json")
+
+    captured_cmd = {}
+
+    def factory(cmd, **kwargs):
+        captured_cmd["cmd"] = cmd
+        return FakeProcess([])
+
+    client = ClaudeSessionClient(store, popen_factory=factory, system_prompt="You are Waypoint.")
+    list(client.run_turn(content_blocks=[{"type": "text", "text": "hi"}], model="sonnet"))
+
+    assert "--system-prompt" in captured_cmd["cmd"]
+    assert captured_cmd["cmd"][captured_cmd["cmd"].index("--system-prompt") + 1] == "You are Waypoint."
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1230,16 +1283,38 @@ class SessionStore:
         self.path.write_text(json.dumps({"session_id": session_id}))
 
 
-def build_claude_command(session_id: Optional[str], model: str) -> list[str]:
+def load_persona(skill_path: Path) -> str:
+    """Strips the YAML frontmatter from teaching-mode's SKILL.md,
+    returning just the body. Used as literal --system-prompt content -
+    NOT relying on Claude Code's own skill-discovery mechanism, which
+    only makes a skill *available* for the model to invoke on its own
+    judgment. Verified live: a plain cwd-based skill discovery left the
+    model answering as the user's own global CLAUDE.md persona instead
+    of Waypoint's, even when explicitly asked "quem é você?" -
+    discovery is not the same as always-active context. --system-prompt
+    (full replacement, not --append-system-prompt) is what reliably
+    switches the model's identity (spec Component 7/13 finding)."""
+    text = skill_path.read_text()
+    parts = text.split("---", 2)
+    if len(parts) == 3:
+        return parts[2].strip()
+    return text.strip()
+
+
+def build_claude_command(session_id: Optional[str], model: str, system_prompt: Optional[str] = None) -> list[str]:
     """Bootstrap (session_id is None): plain new session, no --resume,
     no --continue. Pinned (session_id is set): --resume explicitly.
     Never --continue - see spec Component 7 for why. --strict-mcp-config
     drops the user's unrelated MCP servers (Jira/Gmail/Grafana/etc.) with
-    no functional downside (spec Component 7, stream-json spike)."""
+    no functional downside (spec Component 7, stream-json spike).
+    --system-prompt carries the teaching-mode persona (see load_persona) -
+    passed on every call since each turn is a separate subprocess."""
     cmd = [
         "claude", "--input-format", "stream-json", "--output-format", "stream-json",
         "--model", model, "--strict-mcp-config",
     ]
+    if system_prompt:
+        cmd += ["--system-prompt", system_prompt]
     if session_id:
         cmd += ["--resume", session_id]
     return cmd
@@ -1250,13 +1325,14 @@ def extract_session_id(event: dict) -> str:
 
 
 class ClaudeSessionClient:
-    def __init__(self, session_store: SessionStore, popen_factory=subprocess.Popen):
+    def __init__(self, session_store: SessionStore, popen_factory=subprocess.Popen, system_prompt: Optional[str] = None):
         self.session_store = session_store
         self._popen_factory = popen_factory
+        self.system_prompt = system_prompt
 
     def run_turn(self, content_blocks: list[dict], model: str) -> Iterator[dict]:
         session_id = self.session_store.read()
-        cmd = build_claude_command(session_id, model)
+        cmd = build_claude_command(session_id, model, system_prompt=self.system_prompt)
         process = self._popen_factory(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 
         request = {"type": "user", "message": {"role": "user", "content": content_blocks}}
@@ -1278,7 +1354,7 @@ class ClaudeSessionClient:
 cd /home/tony/projects/clicky-cc/waypoint && pytest tests/test_claude_session.py -v
 ```
 
-Expected: 7 passed. **If Task 2's findings showed different field names** (e.g. `session_id` nested under a different key), fix `extract_session_id()` and the corresponding test now, before moving on.
+Expected: 12 passed. **If Task 2's findings showed different field names** (e.g. `session_id` nested under a different key), fix `extract_session_id()` and the corresponding test now, before moving on.
 
 - [ ] **Step 5: Commit**
 
@@ -1579,6 +1655,19 @@ cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/tts.py && git comm
 
 No unit test — `XGrabKey` requires a live X11 display and root window access. Manual verification only.
 
+**Revised during implementation**: the original `_parse_binding()`/`start()` below used
+`root.grab_key(X.AnyKey, mask, ...)` for a modifier-only binding. Verified live against a real
+GNOME session: this fails with an asynchronous `BadAccess` X error the moment *any* other client
+(the window manager, in practice always true - GNOME/mutter typically has some Ctrl+Alt+*
+binding already) holds a grab on any single keycode under that same modifier mask.
+`python-xlib`'s `grab_key()` never raises this as a Python exception (`GrabKey` has no
+synchronous reply), so the bug is silent - the hotkey would just never fire on a real desktop,
+with no error anywhere. Fix: grab the *last* modifier's own physical keycode (e.g. `Control_L`)
+with the *other* modifiers as the mask (e.g. `Mod1Mask` for Alt) - this is what the docstring
+already described in prose, the code just didn't implement it. Also added an explicit error
+handler so a genuine grab conflict raises `HotkeyGrabError` instead of failing silently. The code
+block below reflects the fix, not the original buggy version.
+
 - [ ] **Step 1: Write the implementation**
 
 ```python
@@ -1596,17 +1685,36 @@ _MODIFIER_MASKS = {
     "super": X.Mod4Mask,
 }
 
+# Modifier name -> the keysym of its own physical key, used when the
+# whole binding is modifier-only (e.g. "ctrl+alt" has no letter key).
+_MODIFIER_OWN_KEYSYMS = {
+    "ctrl": XK.XK_Control_L,
+    "alt": XK.XK_Alt_L,
+    "shift": XK.XK_Shift_L,
+    "super": XK.XK_Super_L,
+}
 
-def _parse_binding(binding: str) -> tuple[int, int]:
-    """'ctrl+alt' -> (combined modifier mask, keycode). The keycode for
-    a pure-modifier combo (no letter key) grabs on the last modifier's
-    own keysym, matching GlobalPushToTalkShortcutMonitor.swift's
-    modifier-only shortcut behavior (spec Component 3)."""
+
+class HotkeyGrabError(RuntimeError):
+    """Raised when XGrabKey fails - most commonly because another
+    client already holds a grab on the same keycode+modifier
+    combination. See the note above start() for why this needs an
+    explicit error handler rather than a try/except."""
+
+
+def _parse_binding(display: Display, binding: str) -> tuple[int, int]:
+    """'ctrl+alt' -> (keycode of the *last* modifier's own key, combined
+    mask of every modifier *except* the last one). Grabbing X.AnyKey
+    with the full combined mask looks equivalent but isn't - see the
+    note above for why."""
     parts = binding.lower().split("+")
+    *other_parts, last_part = parts
     mask = 0
-    for part in parts:
+    for part in other_parts:
         mask |= _MODIFIER_MASKS[part]
-    return mask, 0  # keycode resolved against the live display in start()
+    keysym = _MODIFIER_OWN_KEYSYMS[last_part]
+    keycode = display.keysym_to_keycode(keysym)
+    return keycode, mask
 
 
 class HotkeyListener:
@@ -1615,6 +1723,8 @@ class HotkeyListener:
         self._display: Optional[Display] = None
         self._on_press: Optional[Callable[[], None]] = None
         self._on_release: Optional[Callable[[], None]] = None
+        self._grab_keycode: Optional[int] = None
+        self._grab_mask: Optional[int] = None
 
     def set_binding(self, binding: str) -> None:
         self.binding = binding
@@ -1624,9 +1734,22 @@ class HotkeyListener:
         self._on_release = on_release
         self._display = Display()
         root = self._display.screen().root
-        mask, _ = _parse_binding(self.binding)
-        root.grab_key(X.AnyKey, mask, True, X.GrabModeAsync, X.GrabModeAsync)
+
+        errors: list[Exception] = []
+        self._display.set_error_handler(lambda err, req=None: errors.append(err))
+
+        keycode, mask = _parse_binding(self._display, self.binding)
+        self._grab_keycode, self._grab_mask = keycode, mask
+        root.grab_key(keycode, mask, True, X.GrabModeAsync, X.GrabModeAsync)
         self._display.sync()
+
+        if errors:
+            self._display.close()
+            self._display = None
+            raise HotkeyGrabError(
+                f"Failed to grab hotkey '{self.binding}' - it's likely already bound by "
+                f"another application (e.g. the window manager). Try a different binding."
+            )
 
         pressed = False
         while True:
@@ -1641,7 +1764,8 @@ class HotkeyListener:
     def stop(self) -> None:
         if self._display:
             root = self._display.screen().root
-            root.ungrab_key(X.AnyKey, X.AnyModifier)
+            if self._grab_keycode is not None:
+                root.ungrab_key(self._grab_keycode, self._grab_mask)
             self._display.close()
             self._display = None
 ```
@@ -1657,7 +1781,7 @@ listener.start(on_press=lambda: print('PRESS'), on_release=lambda: print('RELEAS
 "
 ```
 
-Expected: pressing and releasing Ctrl+Alt on the real Pop!_OS X11 session prints `PRESS`/`RELEASE`. Ctrl+C to stop.
+Expected: pressing and releasing Ctrl+Alt on the real Pop!_OS X11 session prints `PRESS`/`RELEASE`. Ctrl+C to stop. **Note**: this needs a real physical key press - XTest synthetic key injection was tried as an automated substitute during implementation and produced no error but also no delivered event (inconclusive on this sandboxed X session). Grab correctness itself (no `BadAccess`, per the fix above) was verified live; the full press/release round trip still needs a human at the keyboard before Task 15 is signed off.
 
 - [ ] **Step 3: Commit**
 
@@ -1667,14 +1791,24 @@ cd /home/tony/projects/clicky-cc && git add waypoint/waypoint/hotkey.py && git c
 
 ---
 
-### Task 16: Teaching-mode skill file (Component 13)
+### Task 16: Teaching-mode persona file (Component 13)
 
 **Files:**
 - Create: `waypoint/.claude/skills/teaching-mode/SKILL.md`
 
 **Interfaces:**
 - Consumes: the tag syntax defined in Task 6 (`POINT`/`HIGHLIGHT`/`ANNOTATE`).
-- Produces: a file discovered automatically by the `claude` CLI subprocess (Task 10) when its `cwd` is `waypoint/`. No code interface — this is the "system prompt" for the app.
+- Produces: a file read directly by `claude_session.load_persona()` (Task 10) and passed as
+  `--system-prompt` content. **Not** discovered automatically via Claude Code's own
+  skill-invocation mechanism — see the note below.
+
+**Revised during implementation**: originally this file was meant to be auto-discovered via
+`cwd` the way any project-local skill is, with Claude Code injecting it as active context on its
+own. Verified live that this doesn't happen — a discoverable skill is only an *available tool the
+model can choose to invoke*, and in practice it didn't, even when explicitly asked "quem é você?"
+or given the skill's own literal trigger phrase. The frontmatter (`name`, `description`) is kept
+here for documentation/versioning value only; Task 10's `load_persona()` strips it and the body
+becomes the `--system-prompt` string on every turn instead.
 
 - [ ] **Step 1: Write the skill file**
 
@@ -1719,15 +1853,22 @@ your context. If the user references a past conversation ("volta naquele papo so
 use this index to recognize what they mean - the app handles the actual session switch.
 ```
 
-- [ ] **Step 2: Verify discovery**
+- [ ] **Step 2: Verify the persona activates via --system-prompt**
 
 ```bash
 cd /home/tony/projects/clicky-cc/waypoint
-echo '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"quem é você?"}]}}' | \
-  claude --input-format stream-json --output-format stream-json --model sonnet
+python3 -c "
+import json
+content = open('.claude/skills/teaching-mode/SKILL.md').read().split('---', 2)[2]
+req = {'type':'user','message':{'role':'user','content':[{'type':'text','text':'quem é você?'}]}}
+print(json.dumps(req))
+" | claude --input-format stream-json --output-format stream-json --model sonnet --strict-mcp-config \
+  --system-prompt "$(python3 -c "print(open('.claude/skills/teaching-mode/SKILL.md').read().split('---', 2)[2])")"
 ```
 
-Expected: the response reflects the teaching-mode persona (mentions pointing/screen/teaching), confirming the CLI picked up the skill from `cwd`.
+Expected: the response reflects the teaching-mode persona (mentions pointing/screen/teaching, in
+character as Waypoint) — confirming `--system-prompt` delivery works, not that `cwd` discovery
+picked anything up (it doesn't, see above).
 
 - [ ] **Step 3: Commit**
 
@@ -2053,7 +2194,7 @@ from waypoint.audio_capture import MicRecorder
 from waypoint.stt import Transcriber
 from waypoint.screen_capture import capture_all_screens
 from waypoint.model_routing import resolve_model
-from waypoint.claude_session import ClaudeSessionClient, SessionStore
+from waypoint.claude_session import ClaudeSessionClient, SessionStore, load_persona
 from waypoint.context_manager import ContextManager
 from waypoint.ollama_fallback import pick_vision_model
 from waypoint.tags import parse_tags, strip_tags
@@ -2074,11 +2215,23 @@ class WaypointApp:
         self.mic = MicRecorder()
         self.transcriber = Transcriber()
         self.session_store = SessionStore(CURRENT_SESSION_FILE)
-        self.claude_client = ClaudeSessionClient(self.session_store)
+        self.claude_client = ClaudeSessionClient(self.session_store, system_prompt=self._build_system_prompt())
         self.context_manager = ContextManager()
         self.tts = PiperTTS(model_path="~/.waypoint/models/pt_BR-faber-medium.onnx")
         self.overlays: list[AnnotationOverlay] = []
         self._last_activity = time.monotonic()
+
+    def _build_system_prompt(self) -> str:
+        # Component 7/13: skill auto-discovery via cwd doesn't reliably
+        # inject content (verified live, Task 16) - the persona is read
+        # directly and passed as --system-prompt instead. MEMORY.md is
+        # appended after it so cross-session continuity (Component 12)
+        # rides the same mechanism rather than relying on cwd residency.
+        skill_path = Path(__file__).parent.parent / ".claude" / "skills" / "teaching-mode" / "SKILL.md"
+        persona = load_persona(skill_path)
+        if MEMORY_INDEX_FILE.exists():
+            persona += "\n\n## MEMORY.md\n\n" + MEMORY_INDEX_FILE.read_text()
+        return persona
 
     def on_hotkey_press(self) -> None:
         self.controller.on_hotkey_press()

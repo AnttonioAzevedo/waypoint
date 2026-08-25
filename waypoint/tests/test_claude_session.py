@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from waypoint.claude_session import SessionStore, build_claude_command, extract_session_id, ClaudeSessionClient
+from waypoint.claude_session import SessionStore, build_claude_command, extract_session_id, ClaudeSessionClient, load_persona
 
 
 def test_session_store_read_returns_none_when_file_missing(tmp_path):
@@ -32,6 +32,34 @@ def test_build_claude_command_with_session_id_pins_via_resume():
     assert cmd[cmd.index("--resume") + 1] == "abc123"
     assert "--continue" not in cmd
     assert "--strict-mcp-config" in cmd
+
+
+def test_build_claude_command_includes_system_prompt_when_given():
+    cmd = build_claude_command(session_id=None, model="sonnet", system_prompt="You are Waypoint.")
+    assert "--system-prompt" in cmd
+    assert cmd[cmd.index("--system-prompt") + 1] == "You are Waypoint."
+
+
+def test_build_claude_command_omits_system_prompt_when_none():
+    cmd = build_claude_command(session_id=None, model="sonnet")
+    assert "--system-prompt" not in cmd
+
+
+def test_load_persona_strips_frontmatter(tmp_path):
+    skill_path = tmp_path / "SKILL.md"
+    skill_path.write_text(
+        "---\nname: teaching-mode\ndescription: something\n---\n\n"
+        "# Teaching-mode persona\n\nYou are Waypoint.\n"
+    )
+    persona = load_persona(skill_path)
+    assert persona == "# Teaching-mode persona\n\nYou are Waypoint."
+    assert "name: teaching-mode" not in persona
+
+
+def test_load_persona_returns_full_text_when_no_frontmatter(tmp_path):
+    skill_path = tmp_path / "SKILL.md"
+    skill_path.write_text("Just plain text, no frontmatter.")
+    assert load_persona(skill_path) == "Just plain text, no frontmatter."
 
 
 def test_extract_session_id_reads_real_fixture():
@@ -93,3 +121,19 @@ def test_run_turn_uses_pinned_session_id_on_subsequent_call(tmp_path):
 
     assert "--resume" in captured_cmd["cmd"]
     assert captured_cmd["cmd"][captured_cmd["cmd"].index("--resume") + 1] == "existing-session"
+
+
+def test_run_turn_passes_configured_system_prompt(tmp_path):
+    store = SessionStore(tmp_path / "current_session.json")
+
+    captured_cmd = {}
+
+    def factory(cmd, **kwargs):
+        captured_cmd["cmd"] = cmd
+        return FakeProcess([])
+
+    client = ClaudeSessionClient(store, popen_factory=factory, system_prompt="You are Waypoint.")
+    list(client.run_turn(content_blocks=[{"type": "text", "text": "hi"}], model="sonnet"))
+
+    assert "--system-prompt" in captured_cmd["cmd"]
+    assert captured_cmd["cmd"][captured_cmd["cmd"].index("--system-prompt") + 1] == "You are Waypoint."
